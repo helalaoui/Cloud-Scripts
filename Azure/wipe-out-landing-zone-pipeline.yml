@@ -1,0 +1,175 @@
+################################################################################
+#                   Pipeline to Wipe Out the Azure Landing Zone
+#
+# Author: Hicham El Alaoui alaoui@rocketmail.com
+# Version 1.4 - 2023-03-22
+################################################################################
+trigger: none
+
+variables:
+- template: config/variables/common.yml
+- template: config/variables/${{ variables['mainVariablesFile'] }}
+- name: wipe_out_landing_zone_script
+  value: 'scripts/wipeOutAzureLZ.py'
+# - name: wipe_out_landing_zone_script
+#   value: 'scripts/testHicham.py'
+
+parameters:
+  - name: runPhase1
+    displayName: Delete Resource Groups whose name ends with the suffix of the Landing Zone?
+    type: boolean
+    default: false
+  - name: runPhase2
+    displayName: Move all subscriptions to the Root Management Group?
+    type: boolean
+    default: false
+  - name: runPhase3
+    displayName: Delete All Management Groups of the target Environment?
+    type: boolean
+    default: false
+  - name: checkTagsBeforeDelete
+    displayName: "Check the value of the 'NomDuSysteme' resource tag before deleting resources?"
+    type: boolean
+    default: true
+
+stages:
+  ################################################################################
+  #                                 Stage: Phase 0
+  # Get the list of Resource Groups to Delete
+  ################################################################################
+- stage: stageGetListOfRGtoDelete
+  displayName: Get the list of Resource Groups to Delete
+  jobs:
+  # First get the list of resource groups to delete, in order to request user validation
+  - job: jobGetListOfRGtoDelete
+    displayName: Get the list of Resource Groups to Delete
+    condition: eq(${{ parameters.runPhase1 }}, 'true')
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+    - task: Bash@3
+      displayName: Install Python Packages for Azure
+      inputs:
+        targetType: inline
+        script: pip install azure-identity azure-mgmt-resource azure-mgmt-managementgroups
+    - task: AzureCLI@2
+      displayName: Get the list of Resource Groups to be deleted
+      inputs:
+        scriptType: bash
+        scriptLocation: inlineScript
+        azureSubscription: $(serviceConnectionName)
+        # Use this escape_data function because the script output includes new lines.
+        inlineScript: |
+          pythonOut=$( \
+            python $(wipe_out_landing_zone_script) \
+              --dry-run-phase-1 \
+              --tenant-id=$(var-tenantId) \
+              --org-top-mgmt-group-id=$(var-organisation-id) \
+              --rg-name-suffix=$(var-platform-short-region-name)$(var-platform-iteration) \
+          )
+          echo "+++++++++ DEBUG - Python Script Output ++++++++++++++++++"
+          echo "$pythonOut"
+          pythonOut=$(echo "$pythonOut" | perl -pe 's/%/$1%AZP25/')
+          pythonOut=$(echo "$pythonOut" | perl -pe 's/\n/$1%0A/')
+          pythonOut=$(echo "$pythonOut" | perl -pe 's/\r/$1%0D/')
+          echo "+++++++++ DEBUG - Sanitized Python Script Output ++++++++++++++++++"
+          pythonOut=$(echo "%0A%0A$pythonOut")
+          echo "$pythonOut"
+          echo "+++++++++ DEBUG - End ++++++++++++++++++"
+          echo "##vso[task.setvariable variable=listOfRGs;isoutput=true]$pythonOut"
+      name: scriptOutput
+
+  ################################################################################
+  #                                 Stage: Phase 1
+  # Get the user validation before delete. Then, Delete the Resource Groups
+  ################################################################################
+- stage: stageDeleteRG
+  displayName: Delete the Resource Groups
+  dependsOn: stageGetListOfRGtoDelete
+  jobs:
+    ################################################################################
+    # Request User Validation before Delete
+  - job: jobValidateDelete
+    displayName: Wait for User to Validate the Delete
+    condition: eq(${{ parameters.runPhase1 }}, 'true')
+    pool: server
+    timeoutInMinutes: 1440 # 1 day
+    variables:
+      listOfRGs: $[ stageDependencies.stageGetListOfRGtoDelete.jobGetListOfRGtoDelete.outputs['scriptOutput.listOfRGs'] ]
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 1440 # 1 day
+      inputs:
+        notifyUsers: |
+          $(var-common-tags-nom-proprietaire)
+        instructions: "The following Azure Resource Groups and all resources beneath will be PERMANENTLY DELETED! Please review CAREFULLY this list before resuming this pipeline! $(listOfRGs)"
+    ################################################################################
+    # Run the actual script for phases 1 only
+  - job: jobPhase1
+    displayName: Delete the Resource Groups
+    dependsOn: jobValidateDelete
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+    - task: Bash@3
+      displayName: Install Python Packages for Azure
+      inputs:
+        targetType: inline
+        script: pip install azure-identity azure-mgmt-resource azure-mgmt-managementgroups
+    - task: AzureCLI@2
+      displayName: 'Run $(wipe_out_landing_zone_script)'
+      inputs:
+        scriptType: bash
+        scriptLocation: inlineScript
+        azureSubscription: $(serviceConnectionName)
+        inlineScript: |
+          python $(wipe_out_landing_zone_script) \
+            --no-delete-confirmation \
+            --run-phase-1=${{ parameters.runPhase1 }} \
+            --tenant-id=$(var-tenantId) \
+            --rg-name-suffix=$(var-platform-short-region-name)$(var-platform-iteration) \
+            --org-top-mgmt-group-id=$(var-organisation-id) \
+            --check-org-tag=${{ parameters.checkTagsBeforeDelete }} \
+            --org-tag=$(var-common-tags-nom-système)
+
+
+  ################################################################################
+  #                             Stage: Phases 2 & 3
+  # Move Subscriptions to Root and Delete Management Groups
+  ################################################################################
+- stage: stagePhases2and3
+  displayName: Move Subscriptions to Root and Delete Management Groups
+  dependsOn: stageDeleteRG
+  condition:
+    or(
+      eq(${{ parameters.runPhase2 }}, 'true'),
+      eq(${{ parameters.runPhase3 }}, 'true')
+    )
+  jobs:
+  - job: jobPhases2and3
+    displayName: Move Subscriptions and Delete Management Groups
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+    - task: Bash@3
+      displayName: Install Python Packages for Azure
+      inputs:
+        targetType: inline
+        script: pip install azure-identity azure-mgmt-resource azure-mgmt-managementgroups
+    - task: AzureCLI@2
+      displayName: 'Run $(wipe_out_landing_zone_script)'
+      inputs:
+        scriptType: bash
+        scriptLocation: inlineScript
+        azureSubscription: $(serviceConnectionName)
+        inlineScript: |
+          python $(wipe_out_landing_zone_script) \
+            --run-phase-2=${{ parameters.runPhase2 }} \
+            --run-phase-3=${{ parameters.runPhase3 }} \
+            --tenant-id=$(var-tenantId) \
+            --org-top-mgmt-group-id=$(var-organisation-id) \
+
+

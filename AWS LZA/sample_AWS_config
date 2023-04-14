@@ -1,0 +1,8 @@
+[default]
+region=ca-central-1
+
+
+[profile Journalisation]
+role_arn = arn:aws:iam::111111111111:role/OrganizationAccountAccessRole
+source_profile=default
+
