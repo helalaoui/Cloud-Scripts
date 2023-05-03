@@ -3,6 +3,12 @@ region=ca-central-1
 
 
 [profile Journalisation]
+role_arn = arn:aws:iam::222222222222:role/OrganizationAccountAccessRole
+source_profile=default
+
+
+[profile Securite]
 role_arn = arn:aws:iam::111111111111:role/OrganizationAccountAccessRole
 source_profile=default
+
 

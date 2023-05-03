@@ -1,9 +1,12 @@
 ############################################################################
 #                     Azure Landing Zone Wipe-Out Script
 #
+#    ******************   USE AT YOUR OWN RISK !!! *****************
+#
 # Script in 3 phases:
 #   - Phase 1: Deletes Resource Groups whose name ends with the suffix that
-#              was specified in the parameters section below.
+#              was specified in the parameters section below and that are under the
+#               top level management group of the organization
 #   - Phase 1 Dry Run: Runs Phase 1 without actually deleting the resource groups.
 #                      Prints the list of resource groups that would be deleted.
 #   - Phase 2: Moves all subscriptions under The Root Management Group.
@@ -15,8 +18,8 @@
 #  The context for execution of this script should already have a valid
 #    Azure authentication context (e.g. Azure CLI az login already done).
 #
-#  Version 1.4 - 2023-03-22
-#  Author: Hicham El Alaoui - alaoui@rocketmail.com
+#  Version 1.5 - 2023-04-27
+#  Author: Hicham El Alaoui - alaoui@it-pro.com
 ############################################################################
 
 # Constants - Do not modify
@@ -82,11 +85,11 @@ def vprint(message, message_verbose_level=VERBOSE_LOW):
 # If there are arguments, then they take precedence over the above parameters
 # Please run this script with a -h for a help on the command line syntax.
 ############################################################################
-pre_run_phase_1 = False
+dry_run_phase_1 = False
 delete_confirmation = True
 if len(sys.argv) > 1:
     parser = argparse.ArgumentParser(description="Parser for the wiper script", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--dry-run-phase-1", action="store_true", dest="pre_run_phase_1", help=f"Dry run Phase 1 to get the list of Resource Groups to be deleted.")
+    parser.add_argument("--dry-run-phase-1", action="store_true", dest="dry_run_phase_1", help=f"Dry run Phase 1 to get the list of Resource Groups to be deleted.")
     parser.add_argument("--no-delete-confirmation", action="store_true", dest="no_delete_confirmation", help=f"Delete the Resource Groups without asking for confirmation.")
     parser.add_argument("--run-phase-1", action="store", dest="run_phase_1", choices=["True", "False"], default="False", help=f"Run Phase 1: {PHASE1_DESCRIPTION}.")
     parser.add_argument("--run-phase-2", action="store", dest="run_phase_2", choices=["True", "False"], default="False", help=f"Run Phase 2: {PHASE2_DESCRIPTION}.")
@@ -99,8 +102,8 @@ if len(sys.argv) > 1:
 
     args = parser.parse_args()
 
-    if args.pre_run_phase_1:
-        pre_run_phase_1 = True
+    if args.dry_run_phase_1:
+        dry_run_phase_1 = True
         run_phase["Phase 1"] = True
         run_phase["Phase 2"] = False
         run_phase["Phase 3"] = False
@@ -110,7 +113,7 @@ if len(sys.argv) > 1:
         vprint(f"sys.argv = {sys.argv}", VERBOSE_MEDIUM)
         vprint(f"argparse args = {vars(args)}", VERBOSE_MEDIUM)
 
-        pre_run_phase_1 = False
+        dry_run_phase_1 = False
         delete_confirmation = not args.no_delete_confirmation
 
         run_phase["Phase 1"] = eval(args.run_phase_1)
@@ -170,21 +173,59 @@ if current_tenant_id != target_tenant_id:
     exit(1)    
 
 ############################################################################
+#                  Collect the List of Target Subscriptions 
+############################################################################
+root_mgmt_group = None
+mg_client = ManagementGroupsAPI(credential)
+all_mgmt_groups = [group for group in mg_client.entities.list()]
+
+# Scroll all mgmt groups in order to identify:
+#   - the list of subscriptions which are under the organization's top management group
+#   - the root mgmt group
+wipe_out_scope = organization_top_mgmt_group_id
+subscriptions_in_scope = []
+vprint(f"Scrolling all mgmt groups to identify the root mgmt group and the subscription that are in the scope ...", VERBOSE_MEDIUM)
+for group in all_mgmt_groups:
+    vprint(f"Group: {group.name}\t{group.type}", VERBOSE_MEDIUM)
+    vprint(group, VERBOSE_HIGH)
+    # In the list here you have the entire hierarchical tree, including the subscriptions,
+    if group.type == 'Microsoft.Management/managementGroups':
+
+        # Identification of the Root Mgmt Group:
+        if not group.parent_name_chain and group.display_name == 'Tenant Root Group':
+            vprint(f"======Root Mgmt Group Identified: {group.name}", VERBOSE_MEDIUM)
+            root_mgmt_group = group
+
+    elif group.type == '/subscriptions' : # This is a subscription
+        # Collect only the subscriptions which are under the organization top management group
+        # For that purpose we need to check the whole parent chain
+        for parent in group.parent_name_chain:
+            if parent == wipe_out_scope:
+                subscriptions_in_scope.append(
+                        {
+                            'name': group.display_name,
+                            'id': group.name,
+                        }
+                    )
+                vprint(f"Adding Subscription: {group.display_name}", VERBOSE_MEDIUM)
+                break
+
+############################################################################
 #                       Phase 1: Delete Resource Groups
 ############################################################################
 vprint(f"\n============ Phase 1: {PHASE1_DESCRIPTION}\n")
 if run_phase['Phase 1']:
 
     ### Gathering the list of subscriptions that have groups that need to be deleted
-    target_subscriptions = []
+    subscriptions_to_wipe = []
     rg_delete_count = 0
 
-    for sub in all_subscriptions:
-        vprint(f"Subscription: {sub.display_name}:")
+    for sub in subscriptions_in_scope:
+        vprint(f"Subscription: {sub['name']}:")
         vprint(sub, VERBOSE_HIGH)
         
         # Retrieve the list of resource groups of this subscription
-        resource_client = ResourceManagementClient(credential, sub.subscription_id)
+        resource_client = ResourceManagementClient(credential, sub['id'])
 
         # Filter resource groups that have the right suffix. If one found, this makes 
         # the current subscription a target subscription
@@ -196,14 +237,14 @@ if run_phase['Phase 1']:
         for group in resource_groups:
             vprint(group, VERBOSE_HIGH)
             if group.name.endswith(resource_suffix):
-                if pre_run_phase_1:
+                if dry_run_phase_1:
                     vprint(group.name, VERBOSE_NONE)
                 else:
                     vprint(f"\t{group.name}", VERBOSE_LOW)
                 
                 # For added security, check if all the resources of this resource group have the right tag 
                 for resource in resource_client.resources.list_by_resource_group(group.name):
-                    if pre_run_phase_1:
+                    if dry_run_phase_1:
                         vprint(f"\t{resource.name}", VERBOSE_NONE)
                     else:
                         vprint(f"\t\t{resource.name}", VERBOSE_LOW)
@@ -236,10 +277,10 @@ if run_phase['Phase 1']:
                 network_watcher_rg_candidate = group
             
         if not target_groups:
-            vprint(f"... No target resource groups in Subscription {sub.display_name}. Skipping ...")
+            vprint(f"... No target resource groups in Subscription {sub['name']}. Skipping ...")
             continue
         
-        # Else, (if there are target resource groups in this subscription) then this is a target subscription
+        # Else, (if there are target resource groups in this subscription) then this is a subscription to wipe
 
         # Since this is a target subscription, add the NetworkWatcherRG resource group (if any) to the target group list
         if network_watcher_rg_candidate:
@@ -247,17 +288,19 @@ if run_phase['Phase 1']:
             vprint(f"\t\t{network_watcher_rg_candidate.name} in {network_watcher_rg_candidate.location}")
         
         # Build the list of target subscriptions and their target groups
-        target_subscriptions.append({
-            'name': sub.display_name,
-            'id': sub.subscription_id,
-            'resource_groups': target_groups,
-            'resource_client': resource_client
-            })
+        subscriptions_to_wipe.append(
+                {
+                    'name': sub['name'],
+                    'id': sub['id'],
+                    'resource_groups': target_groups,
+                    'resource_client': resource_client
+                }
+            )
         rg_delete_count += len(target_groups)
 
 
     ### Delete the target list of resource groups (unless this is a dry-run phase)
-    if pre_run_phase_1:
+    if dry_run_phase_1:
         vprint("\nThis is a dry-run of phase 1. No resource groups will be deleted.", VERBOSE_MEDIUM)
     else:
         if rg_delete_count:
@@ -267,7 +310,7 @@ if run_phase['Phase 1']:
                 user_input = 'yes'
 
             if user_input == 'yes':
-                for sub in target_subscriptions:
+                for sub in subscriptions_to_wipe:
                     vprint("Subscription: " + sub['name'])
                     vprint(sub, VERBOSE_HIGH)
                     
@@ -289,58 +332,22 @@ else: # run_phase['Phase 1'] == False
 ############################################################################
 vprint(f"\n============ Phase 2: {PHASE2_DESCRIPTION}\n")
 
-root_mgmt_group = None
-mg_client = None
-
 if run_phase['Phase 2']:
-    mg_client = ManagementGroupsAPI(credential)
-    all_mgmt_groups = [group for group in mg_client.entities.list()]
+    # Move the target subscriptions under the root management group:
+    if subscriptions_in_scope:
+        for sub in subscriptions_in_scope:
+            vprint(f"Moving Subscription '{sub['name']}' under root ...", VERBOSE_LOW)
+            mg_client.management_group_subscriptions.create(root_mgmt_group.name, sub['id'])
+
+        WAIT_SECONDS = 5
+        # Wait WAIT_SECONDS seconds (for each move operation) until the move operations are completed
+        timer = WAIT_SECONDS * len(subscriptions_in_scope)
+        vprint(f"... Waiting {timer} seconds for the move operations to complete ...")
+        sleep(timer)
+    else:
+        vprint(f"There are no subscriptions under the organization top management group {organization_top_mgmt_group_id}.")
 else:
-    all_mgmt_groups = []
     vprint("=> You chose to skip Phase 2. Skipping ...")
-
-
-# Scroll all mgmt groups in order to identify:
-#   - the list of subscriptions which are under the organization's top management group
-#   - the root mgmt group
-subscriptions_to_move = []
-for group in all_mgmt_groups:
-    vprint(f"Group: {group.name}\t{group.type}", VERBOSE_MEDIUM)
-    vprint(group, VERBOSE_HIGH)
-    # In the list here you have the entire hierarchical tree, including the subscriptions,
-    if group.type == 'Microsoft.Management/managementGroups':
-
-        # Identification of the Root Mgmt Group:
-        if not group.parent_name_chain and group.display_name == 'Tenant Root Group':
-            vprint(f"======Root Mgmt Group Identified: {group.name}", VERBOSE_MEDIUM)
-            root_mgmt_group = group
-
-    elif group.type == '/subscriptions' : # This is a subscription
-        # Collect only the subscriptions which are under the organization top management group
-        # For that purpose we need to check the whole parent chain
-        for parent in group.parent_name_chain:
-            if parent == organization_top_mgmt_group_id:
-                subscriptions_to_move.append({
-                    'name': group.display_name,
-                    'id': group.name,
-                    })
-                vprint(f"Adding Subscription: {group.display_name}", VERBOSE_MEDIUM)
-                break
-        
-
-# Move the target subscriptions under the root management group:
-if subscriptions_to_move:
-    for sub in subscriptions_to_move:
-        vprint("Moving Subscription under root: " + sub['name'])
-        mg_client.management_group_subscriptions.create(root_mgmt_group.name, sub['id'])
-
-    WAIT_SECONDS = 5
-    # Wait WAIT_SECONDS seconds (for each move operation) until the move operations are completed
-    timer = WAIT_SECONDS * len(subscriptions_to_move)
-    vprint(f"... Waiting {timer} seconds for the move operations to complete ...")
-    sleep(timer)
-elif run_phase['Phase 2']:
-    vprint(f"There are no subscriptions under the organization top management group {organization_top_mgmt_group_id}.")
 
 ############################################################################
 #       Phase 3: Delete All Management Groups of the target Environment

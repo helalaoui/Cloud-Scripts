@@ -4,11 +4,10 @@ regions = [
     "ca-central-1"
 ]
 
-root_account = "11111111111"
+root_account = "0000000000"
 
 accounts = {
-    "1111111111": "default",
-    "2222222222": "Journalisation",
+    "111111111111": "default",
 }
 
 for region in regions:
@@ -18,14 +17,14 @@ for region in regions:
         client = session.client('resourcegroupstaggingapi')
 
         response = client.get_resources(
-            TagFilters=[
-                {
-                    'Key': 'Accelerator',
-                    'Values': [
-                        'AWSAccelerator',
-                    ]
-                },
-            ],
+            # TagFilters=[
+            #     {
+            #         'Key': 'Accelerator',
+            #         'Values': [
+            #             'AWSAccelerator',
+            #         ]
+            #     },
+            # ],
             ResourcesPerPage=100,
             # ResourceTypeFilters=[
             #     'logs'

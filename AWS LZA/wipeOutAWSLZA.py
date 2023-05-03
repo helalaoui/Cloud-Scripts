@@ -3,20 +3,34 @@
 #
 #    ******************   USE AT YOUR OWN RISK !!! *****************
 #
-# Script in 3 phases:
+# Script in 6 steps:
+#       1: Delete the LZA SCPs
+#       2: For each account:
+#          2a: Delete the AWSAccelerator-xxxxx Stacks
+#          2b: Delete the AWSAccelerator-CDKToolkit stack
+#          2c: Delete the LZA S3 Buckets
+#          2d: Delete the LZA ECR Repository (CDK)
+#          2e: Delete the LZA KMS keys
+#       3: Clean the 'Security' Account
+#       4: Delete the Root Account-specific stacks
+#       5: Delete the Root-specific LZA S3 Buckets
+#       6: Delete the Cost and Usage Report Definition
+#       7: Rename the CodeCommit Repo
+#
+#  Please fill-in the Parameters section before running this script.
 #
 #  The context for execution of this script should already have a valid
 #    AWS authentication context: .aws/credentials and .aws/config
 #
-#  Version 0.2 - 2023-04-12
-#  Author: Hicham El Alaoui - alaoui@rocketmail.com
+#  Version 1.3 - 2023-05-03
+#  Author: Hicham El Alaoui - alaoui@it-pro.com
 #
 ############################################################################
 
 from datetime import datetime
+# AWS SDK for Python modules:
 import boto3
 from botocore.exceptions import ClientError
-
 
 # Constants - Do not modify
 VERBOSE_NONE   = 1
@@ -29,18 +43,21 @@ VERBOSE_HIGH   = 4
 ############################################################################
 
 regions = [
-    "ca-central-1"
+    # "us-east-1",
+    "ca-central-1",
 ]
 
-root_account = "1111111111111111"
+root_account = "00000000000000"
 root_profile = "default"
 
 # List of non-root accounts and their profile name
+# The profile name references the section for that account in the .aws/config file.
 lza_non_root_accounts = {
-    "222222222222": "Journalisation",
+    "11111111111": "Securite",
 }
 
-lza_security_account_id = "126235163086"
+# The security account that needs to be cleaned in step 5:
+lza_security_account_id = "11111111111"
 
 # Message verbose level you want. Options: VERBOSE_NONE, VERBOSE_LOW, VERBOSE_MEDIUM,
 #    or VERBOSE_HIGH. Recommended: VERBOSE_LOW.
@@ -79,7 +96,8 @@ lza_root_stacks_in_us_east_1 = [
 lza_cdk_stack = 'AWSAccelerator-CDKToolkit'
 
 lza_buckets = [
-    "s3-access-logs"
+    "s3-access-logs",
+    "auditmgr"
 ]
 
 lza_root_buckets = [
@@ -91,10 +109,14 @@ lza_root_buckets = [
     "s3-logs"
 ]
 
+lza_scp_name_prefix = 'AWSAccelerator-'
+
 lza_tag_name = 'Accelerator'
 lza_tag_value = 'AWSAccelerator'
 
 lza_log_group_name_prefix = '/aws/lambda/AWSAccelerator'
+
+lza_cost_usage_report_name = 'accelerator-cur'
 
 lza_repository_name = 'aws-accelerator-config'
 
@@ -111,102 +133,95 @@ def vprint(message, message_verbose_level=VERBOSE_LOW):
 
 ############################################################################
 # Delete a CloudFormation Stack
-def delete_stack(**kwargs):
-    cloudformation = kwargs['cloudformation_client']
-    stack_name = kwargs['stack_name']
-    wait_till_deleted = kwargs['wait_till_deleted']
-    delete_waiter = kwargs['waiter']
+def delete_stack(cloudformation_client, stack_name, wait_till_deleted=False, waiter=None):
+    vprint(f"Deleting the {stack_name} stack ...", VERBOSE_MEDIUM)
+    # Check if the stack exists and is in a COMPLETE state:
+    try:
+        stack_response = cloudformation_client.describe_stacks(StackName = stack_name)
+    except ClientError as err:
+        vprint(f"\tStack Not Found: {stack_name}.", VERBOSE_MEDIUM)
+        vprint('*'*20 + f"Error message:", VERBOSE_HIGH)
+        vprint(err, VERBOSE_HIGH)
+        return False
+
+    stack_status = stack_response['Stacks'][0]['StackStatus']
+    if stack_status not in ['CREATE_COMPLETE', 'UPDATE_COMPLETE']:
+        vprint(f"\tStack {stack_name} has a status of '{stack_status}' which is not CREATE_COMPLETE nor UPDATE_COMPLETE. Skipping ...", VERBOSE_LOW)
+        return False
     
     try:
         vprint(f"\tDisabling Termination Protection on stack {stack_name}", VERBOSE_MEDIUM)
-        response = cloudformation.update_termination_protection(EnableTerminationProtection=False, StackName=stack_name)
+        response = cloudformation_client.update_termination_protection(EnableTerminationProtection=False, StackName=stack_name)
         vprint(response, VERBOSE_HIGH)
 
-        vprint(f"\tStarting Deletion of the {stack_name} stack", VERBOSE_MEDIUM)
-        cloudformation.delete_stack(StackName=stack_name)
+        vprint(f"Starting Deletion of the {stack_name} stack", VERBOSE_LOW)
+        cloudformation_client.delete_stack(StackName=stack_name)
 
         if wait_till_deleted:
             vprint(f"\tWaiting for stack {stack_name} to finish deleting ...", VERBOSE_LOW)
-            delete_waiter.wait(StackName=stack_name)
+            waiter.wait(StackName=stack_name)
             vprint(f"\tStack {stack_name} deleted ...", VERBOSE_LOW)
+        return True
     except ClientError as err:
-        vprint('*'*20 + f"Unable to delete Stack {stack_name}. Error message:", VERBOSE_LOW)
+        vprint(f"\tUnable to delete Stack {stack_name}!", VERBOSE_LOW)
+        vprint('*'*20 + f"Error message:", VERBOSE_LOW)
         vprint(err, VERBOSE_LOW)
-
-    return
+        return False
 
 ############################################################################
 # Empty and delete a Bucket:
-def delete_bucket(**kwargs):
-    s3 = kwargs['s3_resource']
-    bucket_name = kwargs['bucket_name']
-
-    vprint(f"Deleting bucket {bucket_name} ...", VERBOSE_LOW)
-
-    try:    
-        bucket_versioning = s3.BucketVersioning(bucket_name)
-        vprint(f"\tDeleting all objects in bucket {bucket_name} (bucket versioning {bucket_versioning.status})", VERBOSE_MEDIUM)
+# Returns True if bucket deleted or False otherwise.
+def delete_bucket(s3_resource, bucket_name):
+    try:
+        vprint(f"\tDeleting all objects in bucket {bucket_name}", VERBOSE_MEDIUM)
+        bucket_versioning = s3_resource.BucketVersioning(bucket_name)
     except ClientError as err:
-        vprint(f"\tBucket Not Found!", VERBOSE_LOW)
-        vprint('*'*20 + f" Error message:", VERBOSE_MEDIUM)
+        vprint('*'*20 + f" Bucket Not Found! Error message:", VERBOSE_MEDIUM)
         vprint(err, VERBOSE_MEDIUM)
-        return
+        return False
 
     try:
-        bucket = s3.Bucket(bucket_name)
+        bucket = s3_resource.Bucket(bucket_name)
         if bucket_versioning.status == 'Enabled':
             bucket.object_versions.delete()
         else:
             bucket.objects.all().delete()
-
-        vprint(f"\tStarting deletion of bucket {bucket_name}", VERBOSE_MEDIUM)
+        vprint(f"Deleting bucket {bucket_name} ...", VERBOSE_LOW)
         bucket.delete()
-            
     except ClientError as err:
         vprint('*'*20 + f" Unable to delete bucket {bucket_name}. Error message:", VERBOSE_LOW)
         vprint(err, VERBOSE_LOW)
+        return False
+    else:
+        return True
     
-    return
-
-############################################################################
-# Get an ECR repository:
-def get_ecr_repo(**kwargs):
-    ecr = kwargs['ecr_client']
-    repo_name = kwargs['repo_name']
-
-    try:    
-        response = ecr.describe_repositories(repositoryNames = [repo_name])
-    except ClientError as err:
-        return None
-
-    return response['repositories'][0]
-
 ############################################################################
 # Delete an ECR repository:
-def delete_ecr_repo(**kwargs):
-    ecr = kwargs['ecr_client']
-    repo_name = kwargs['repo_name']
-
-    vprint(f"Deleting ECR Repository {repo_name} ...", VERBOSE_LOW)
+def delete_ecr_repo(ecr_client, repo_name):
+    vprint(f"Deleting ECR Repository {repo_name} ...", VERBOSE_MEDIUM)
     try:    
-        ecr.delete_repository(repositoryName=repo_name, force=True)
+        response = ecr_client.describe_repositories(repositoryNames = [repo_name])
+    except ClientError as err:
+        vprint('*'*20 + f" ECR Repository {repo_name} Not Found! Error message:", VERBOSE_MEDIUM)
+        vprint(err, VERBOSE_MEDIUM)
+        return False
+
+    try:    
+        ecr_client.delete_repository(repositoryName=repo_name, force=True)
             
     except ClientError as err:
         vprint('*'*20 + f" Unable to delete ECR repository {repo_name}. Error message:", VERBOSE_LOW)
         vprint(err, VERBOSE_LOW)
-    
-    return
+        return False
+    else:
+        return True
 
 ############################################################################
-# Delete all KMS keys having a special tag:
-def delete_keys_by_tag(**kwargs):
-    kms = kwargs['kms_client']
-    target_tag_name = kwargs['tag_name']
-    target_tag_value = kwargs['tag_value']
-
+# Delete all KMS keys having a given tag:
+def delete_keys_by_tag(kms_client, target_tag_name, target_tag_value):
     vprint(f"Deleting all KMS keys with tag {target_tag_name} = '{target_tag_value}'...", VERBOSE_MEDIUM)
     
-    keys_response = kms.list_keys(Limit=1000)
+    keys_response = kms_client.list_keys(Limit=1000)
     
     if keys_response['Keys']:
         target_key_found = False
@@ -216,7 +231,7 @@ def delete_keys_by_tag(**kwargs):
                 key_id = key['KeyId']
                 
                 # Check if this is an AWS- or Customer- managed key:
-                key_response = kms.describe_key(KeyId = key_id)
+                key_response = kms_client.describe_key(KeyId = key_id)
                 
                 if key_response['KeyMetadata']['KeyManager'] == 'AWS':
                     # This is an AWS-Managed key. Ignore.
@@ -228,7 +243,7 @@ def delete_keys_by_tag(**kwargs):
                     continue
 
                 # Get the list of tags of this key:
-                tags_response = kms.list_resource_tags(KeyId = key_id)
+                tags_response = kms_client.list_resource_tags(KeyId = key_id)
                 
                 if tags_response['Tags']:
                     # Check if one of the tags matches the target tag
@@ -237,7 +252,7 @@ def delete_keys_by_tag(**kwargs):
                             if tag['TagValue'] == target_tag_value:
                                 target_key_found = True
                                 vprint(f"Scheduling deletion of KMS key {key_id} ...", VERBOSE_LOW)
-                                delete_response = kms.schedule_key_deletion(KeyId = key_id, PendingWindowInDays=7)
+                                delete_response = kms_client.schedule_key_deletion(KeyId = key_id, PendingWindowInDays=7)
                                 vprint(f"\tDeletion scheduled for '{delete_response['DeletionDate']}' GW.", VERBOSE_LOW)
                             else:
                                 vprint(f"\tKMS key {key_id} has a '{target_tag_name}' tag but not with the target value. Actual tag value = '{tag['TagValue']}', target tag value = '{target_tag_value}'.Skipping ...", VERBOSE_LOW)
@@ -259,20 +274,16 @@ def delete_keys_by_tag(**kwargs):
 
 ############################################################################
 # Detach and Delete an SCP policy
-def detach_and_detlete_scp(**kwargs):
-    organizations = kwargs['organizations_client']
-    policy_id = kwargs['policy_id']
-    policy_name = kwargs['policy_name']
-
+def detach_and_delete_scp(organizations_client, policy_id, policy_name):
     # Detach all targets from this policy:
-    targets = organizations.list_targets_for_policy(PolicyId = policy_id)
+    targets = organizations_client.list_targets_for_policy(PolicyId = policy_id)
 
     policy_is_attached = False
     if targets['Targets']:
         for target in targets['Targets']:
             try:
                 vprint(f"\tDetaching SCP {policy_name} from target {target['Name']} ...", VERBOSE_MEDIUM)
-                organizations.detach_policy(PolicyId = policy_id, TargetId = target['TargetId'])
+                organizations_client.detach_policy(PolicyId = policy_id, TargetId = target['TargetId'])
             except ClientError as err:
                 vprint(f"Unable to detach SCP {policy_name} from target {target['Name']}. Error Message:", VERBOSE_LOW)
                 vprint(err, VERBOSE_LOW)
@@ -286,7 +297,7 @@ def detach_and_detlete_scp(**kwargs):
     
     vprint(f"Deleting AWS Organizations SCP {policy_name} ...", VERBOSE_LOW)
     try:
-        organizations.delete_policy(PolicyId = policy_id)
+        organizations_client.delete_policy(PolicyId = policy_id)
     except ClientError as err:
         vprint(f"Unable to delete AWS Organizations SCP {policy_name}. Error Message:", VERBOSE_LOW)
         vprint(err, VERBOSE_LOW)
@@ -303,23 +314,29 @@ if lza_security_account_id not in lza_non_root_accounts:
     exit(1)
 
 ############################################################################
-#                 Phase 1: Delete the LZA SCPs
+#                 Step 1: Delete the LZA SCPs
 ############################################################################
-vprint('\n' + '='*30 + " Phase 1: Delete the LZA SCPs " + '='*30, VERBOSE_LOW)
+vprint('\n' + '>'*10 + " Step 1: Delete the LZA SCPs ", VERBOSE_LOW)
 
 organizations = boto3.client('organizations')
 response = organizations.list_policies(Filter='SERVICE_CONTROL_POLICY')
 
 lza_scp_found = False
 for policy in response['Policies']:
-    if policy['Name'].startswith('AWSAccelerator-'):
-        detach_and_detlete_scp(organizations_client = organizations, policy_id = policy['Id'], policy_name = policy['Name'])
+    if policy['Name'].startswith(lza_scp_name_prefix):
+        detach_and_delete_scp(
+            organizations_client = organizations, 
+            policy_id = policy['Id'], 
+            policy_name = policy['Name']
+        )
         lza_scp_found = True
 
 if not lza_scp_found:
     vprint("There are no LZA SCPs to delete!", VERBOSE_LOW)
 
 
+############################################################################
+#                                  Step 2
 ############################################################################
 
 aws_sessions = {}
@@ -341,50 +358,32 @@ for region in regions:
     ############################################################################
 
     for account_id, account_name in lza_non_root_accounts.items():
-        vprint('\n' + '='*80 + '\n' + ' '*20 + f"Cleaning Account {account_name} ({account_id}) in region {region}\n" + '='*80, VERBOSE_LOW)
+        vprint('\n' + '='*80 + '\n' + ' '*5 + f"Cleaning Account {account_name} ({account_id}) in region {region}\n" + '='*80, VERBOSE_LOW)
         
         ############################################################################
-        #                 Phase 2: Delete AWSAccelerator-xxxxx Stacks
+        #                 Step 2a: Delete the AWSAccelerator-xxxxx Stacks
         ############################################################################
-        vprint('\n' + '='*30 + " Phase 2: Delete the LZA core stacks (AWSAccelerator-xxxxx) " + '='*30, VERBOSE_LOW)
+        vprint('\n' + '>'*10 + " Step 2a: Delete the LZA core stacks (AWSAccelerator-xxxxx) ", VERBOSE_LOW)
 
         cloudformation = aws_sessions[(account_id, region)].client('cloudformation')
         delete_waiter = cloudformation.get_waiter('stack_delete_complete')
         
         stacks_to_delete = []
-        stacks_found = False
+        stacks_deleted = False
         stack_to_wait = None
         for stack in lza_core_stacks:
             stack_name = f"{stack}-{account_id}-{region}"
-            vprint(f"Deleting the {stack_name} stack in the '{account_name}' account in region {region}", VERBOSE_LOW)
             stacks_to_delete.append(stack_name)
 
-            # Check if the stack exists and is in a COMPLETE state:
-            try:
-                stack_response = cloudformation.describe_stacks(StackName = stack_name)
-            except ClientError as err:
-                vprint(f"\tStack Not Found: {stack_name}.", VERBOSE_LOW)
-                vprint('*'*20 + f"Could not find stack {stack_name}. Error message:", VERBOSE_HIGH)
-                vprint(err, VERBOSE_HIGH)
-                continue
-
-            stacks_found = True
-            
-            stack_status = stack_response['Stacks'][0]['StackStatus']
-            if stack_status not in ['CREATE_COMPLETE', 'UPDATE_COMPLETE']:
-                vprint(f"\tStack status '{stack_status}' is not CREATE_COMPLETE nor UPDATE_COMPLETE. Skipping ...", VERBOSE_LOW)
-                continue
-            
-            delete_stack(
+            this_stack_deleted = delete_stack(
                 cloudformation_client = cloudformation,
                 stack_name = stack_name,
-                wait_till_deleted = False,
-                waiter = delete_waiter
+                wait_till_deleted = False
             )
-            
+            stacks_deleted = stacks_deleted or this_stack_deleted
             stack_to_wait = stack_name
         
-        if stacks_found:
+        if stacks_deleted:
             while stack_to_wait:
                 vprint(f"... Waiting for stack {stack_to_wait} to finish deleting ...", VERBOSE_LOW)
                 delete_waiter.wait(StackName = stack_to_wait)
@@ -404,192 +403,67 @@ for region in regions:
             vprint(f"There are no LZA core stacks to delete in account '{account_name}'!", VERBOSE_LOW)
 
         ############################################################################
-        #           Phase 3: Delete the AWSAccelerator-CDKToolkit stack
+        #           Step 2b: Delete the AWSAccelerator-CDKToolkit stack
         ############################################################################
+        vprint('\n' + '>'*10 + f" Step 2b: Delete the AWSAccelerator-CDKToolkit stack in account '{account_name}'", VERBOSE_LOW)
         stack_name = lza_cdk_stack
-        vprint('\n' + '='*30 + " Phase 3: Delete the {stack_name} stack in account '{account_name}'" + '='*30, VERBOSE_LOW)
 
-        # Check if the stack exists and is in a COMPLETE state:
-        try:
-            stack_response = cloudformation.describe_stacks(StackName = stack_name)
-        except ClientError as err:
-            vprint(f"\tStack Not Found: {stack_name}.", VERBOSE_LOW)
-            vprint('*'*20 + f"Could not find stack {stack_name}. Error message:", VERBOSE_HIGH)
-            vprint(err, VERBOSE_HIGH)
-        else:
-            stack_status = stack_response['Stacks'][0]['StackStatus']
-            if stack_status not in ['CREATE_COMPLETE', 'UPDATE_COMPLETE']:
-                vprint(f"\tStack status '{stack_status}' is not CREATE_COMPLETE nor UPDATE_COMPLETE. Skipping ...", VERBOSE_LOW)
-            else:
-                delete_stack(
-                    cloudformation_client = cloudformation,
-                    stack_name = stack_name,
-                    wait_till_deleted = True,
-                    waiter = delete_waiter
-                )
-            
+        this_stack_deleted = delete_stack(
+            cloudformation_client = cloudformation,
+            stack_name = stack_name,
+            wait_till_deleted = True,
+            waiter = delete_waiter
+        )
+    
+        if not this_stack_deleted:
+            vprint(f"There is no {stack_name} stack to delete!")
+
         ############################################################################
-        #           Phase 4: Delete the LZA S3 Buckets
+        #           Step 2c: Delete the LZA S3 Buckets
         ############################################################################
-        vprint('\n' + '='*30 + f" Phase 4: Delete the LZA S3 Buckets in account '{account_name}'" + '='*30, VERBOSE_LOW)
+        vprint('\n' + '>'*10 + f" Step 2c: Delete the LZA S3 Buckets in account '{account_name}'", VERBOSE_LOW)
         
         buckets_to_delete = [f"aws-accelerator-{bucket}-{account_id}-{region}" for bucket in lza_buckets]
         buckets_to_delete += [f"cdk-accel-assets-{account_id}-{region}"]
+        buckets_deleted = False
 
         s3_resource = aws_sessions[(account_id, region)].resource('s3')
         for bucket_name in buckets_to_delete:
-            delete_bucket(s3_resource = s3_resource, bucket_name = bucket_name)
+            delete_status = delete_bucket(s3_resource = s3_resource, bucket_name = bucket_name)
+            buckets_deleted = buckets_deleted or delete_status
+        
+        if not buckets_deleted:
+            vprint("No buckets deleted!", VERBOSE_LOW)
 
         ############################################################################
-        #           Phase 5: Delete the LZA ECR Repository (CDK)
+        #           Step 2d: Delete the LZA ECR Repository (CDK)
         ############################################################################
-        vprint('\n' + '='*30 + f" Phase 5: Delete the LZA ECR Repository (CDK) in account '{account_name}'" + '='*30, VERBOSE_LOW)
+        vprint('\n' + '>'*10 + f" Step 2d: Delete the LZA ECR Repository (CDK) in account '{account_name}'", VERBOSE_LOW)
 
         ecr = aws_sessions[(account_id, region)].client('ecr')
         cdk_repo = f"cdk-accel-container-assets-{account_id}-{region}"
-
-        if get_ecr_repo(ecr_client = ecr, repo_name = cdk_repo):
-            delete_ecr_repo(ecr_client = ecr, repo_name = cdk_repo)
-        else:
+        
+        repo_deleted = delete_ecr_repo(ecr_client = ecr, repo_name = cdk_repo)
+        if not repo_deleted:
             vprint(f"There is no LZA ECR Repository (CDK)!", VERBOSE_LOW)
         
         ############################################################################
-        #           Phase 6: Delete the LZA KMS keys
+        #           Step 2e: Delete the LZA KMS keys
         ############################################################################
-        vprint('\n' + '='*30 + f" Phase 6: Delete the LZA KMS keys in account '{account_name}'" + '='*30, VERBOSE_LOW)
+        vprint('\n' + '>'*10 + f" Step 2e: Delete the LZA KMS keys in account '{account_name}'", VERBOSE_LOW)
 
         kms = aws_sessions[(account_id, region)].client('kms')
 
-        delete_keys_by_tag(kms_client = kms, tag_name = lza_tag_name, tag_value = lza_tag_value)
+        delete_keys_by_tag(kms_client = kms, target_tag_name = lza_tag_name, target_tag_value = lza_tag_value)
         
+# Separator (End of core accounts cleaning)
+vprint('\n' + '='*80, VERBOSE_LOW)
 
 ############################################################################
-#           Phase 7: Delete the Root Account-specific stacks
-############################################################################
-vprint('\n' + '='*30 + f" Phase 7: Delete the Root Account-specific stacks " + '='*30, VERBOSE_LOW)
-
-account_id = root_account
-stacks_found = False
-
-###########################################
-# Delete the root account stacks in regions
-for region in regions:
-    cloudformation = aws_sessions[(account_id, region)].client('cloudformation')
-    delete_waiter = cloudformation.get_waiter('stack_delete_complete')
-    
-    for stack in lza_core_stacks + lza_root_stacks_in_region:
-        stack_name = f"{stack}-{account_id}-{region}"
-        vprint(f"Deleting the {stack_name} stack in the ROOT account in region {region}", VERBOSE_LOW)
-
-        # Check if the stack exists and is in a COMPLETE state:
-        try:
-            stack_response = cloudformation.describe_stacks(StackName = stack_name)
-        except ClientError as err:
-            vprint(f"\tStack Not Found: {stack_name}.", VERBOSE_LOW)
-            vprint('*'*20 + f"Could not find stack {stack_name}. Error message:", VERBOSE_HIGH)
-            vprint(err, VERBOSE_HIGH)
-            continue
-
-        stacks_found = True
-        
-        stack_status = stack_response['Stacks'][0]['StackStatus']
-        if stack_status not in ['CREATE_COMPLETE', 'UPDATE_COMPLETE']:
-            vprint(f"\tStack status '{stack_status}' is not CREATE_COMPLETE nor UPDATE_COMPLETE. Skipping ...", VERBOSE_LOW)
-            continue
-        
-        delete_stack(
-            cloudformation_client = cloudformation,
-            stack_name = stack_name,
-            wait_till_deleted = True,
-            waiter = delete_waiter
-        )
-        
-
-###########################################
-#  Delete the root account stacks specific to 'us-east-1'
-region = 'us-east-1'
-cloudformation = aws_sessions[(account_id, region)].client('cloudformation')
-delete_waiter = cloudformation.get_waiter('stack_delete_complete')
-
-for stack in lza_root_stacks_in_us_east_1:
-    stack_name = f"{stack}-{account_id}-{region}"
-    vprint(f"Deleting the {stack_name} stack in the ROOT account in region {region}", VERBOSE_LOW)
-
-    # Check if the stack exists and is in a COMPLETE state:
-    try:
-        stack_response = cloudformation.describe_stacks(StackName = stack_name)
-    except ClientError as err:
-        vprint(f"\tStack Not Found: {stack_name}.", VERBOSE_LOW)
-        vprint('*'*20 + f"Could not find stack {stack_name}. Error message:", VERBOSE_HIGH)
-        vprint(err, VERBOSE_HIGH)
-        continue
-
-    stacks_found = True
-    
-    stack_status = stack_response['Stacks'][0]['StackStatus']
-    if stack_status not in ['CREATE_COMPLETE', 'UPDATE_COMPLETE']:
-        vprint(f"\tStack status '{stack_status}' is not CREATE_COMPLETE nor UPDATE_COMPLETE. Skipping ...", VERBOSE_LOW)
-        continue
-    
-    delete_stack(
-        cloudformation_client = cloudformation,
-        stack_name = stack_name,
-        wait_till_deleted = True,
-        waiter = delete_waiter
-    )
-
-###########################################
-#  Delete the CDKToolkit stack in the Root account and 'us-east-1' region
-stack_name = 'CDKToolkit'
-vprint(f"Deleting the {stack_name} stack in the ROOT account in region {region}", VERBOSE_LOW)
-
-# Check if the stack exists and is in a COMPLETE state:
-cdk_found = False
-try:
-    stack_response = cloudformation.describe_stacks(StackName = stack_name)
-except ClientError as err:
-    vprint(f"\tStack Not Found: {stack_name}.", VERBOSE_LOW)
-    vprint('*'*20 + f"Could not find stack {stack_name}. Error message:", VERBOSE_HIGH)
-    vprint(err, VERBOSE_HIGH)
-else:
-    cdk_found = True
-
-if cdk_found:
-    stacks_found = True
-
-    stack_status = stack_response['Stacks'][0]['StackStatus']
-    if stack_status in ['CREATE_COMPLETE', 'UPDATE_COMPLETE']:
-        delete_stack(
-            cloudformation_client = cloudformation,
-            stack_name = stack_name,
-            wait_till_deleted = True,
-            waiter = delete_waiter
-        )
-    else:
-        vprint(f"\tStack status '{stack_status}' is not CREATE_COMPLETE nor UPDATE_COMPLETE. Skipping ...", VERBOSE_LOW)
-
-if not stacks_found:
-    vprint(f"There are no root-specific stacks to delete!", VERBOSE_LOW)
-
-############################################################################
-#           Phase 8: Delete the Root-specific LZA S3 Buckets
-############################################################################
-vprint('\n' + '='*30 + f" Phase 8: Delete the Root-specific LZA S3 Buckets " + '='*30, VERBOSE_LOW)
-
-buckets_to_delete = [f"aws-accelerator-{bucket}-{account_id}-{region}" for bucket in lza_root_buckets]
-buckets_to_delete += [f"cdk-accel-assets-{account_id}-{region}"]
-buckets_to_delete += [f"cdk-accel-assets-{account_id}-us-east-1"]
-
-s3_resource = aws_sessions[(account_id, region)].resource('s3')
-for bucket_name in buckets_to_delete:
-    delete_bucket(s3_resource = s3_resource, bucket_name = bucket_name)
-
-
-############################################################################
-#           Phase 9: Clean the 'Security' Account
+#           Step 3: Clean the 'Security' Account
 ############################################################################
 for region in regions:
-    vprint('\n' + '='*30 + f" Phase 9: Clean the 'Security' Account in region '{region}' " + '='*30, VERBOSE_LOW)
+    vprint('\n' + '>'*10 + f" Step 3: Clean the 'Security' Account in region '{region}' ", VERBOSE_LOW)
 
     ssm = aws_sessions[ (lza_security_account_id, region) ].client('ssm')
     
@@ -603,9 +477,12 @@ for region in regions:
         MaxResults = 50
     )
 
-    for parameter in response['Parameters']:
-        vprint(f"Deleting parameter '{parameter['Name']}'", VERBOSE_LOW)
-        ssm.delete_parameter(Name = parameter['Name'])
+    if response['Parameters']:
+        for parameter in response['Parameters']:
+            vprint(f"Deleting parameter '{parameter['Name']}'", VERBOSE_LOW)
+            ssm.delete_parameter(Name = parameter['Name'])
+    else:
+        vprint(f"There are no SSM parameters to delete!", VERBOSE_LOW)
 
     logs = aws_sessions[ (lza_security_account_id, region) ].client('logs')
     
@@ -613,16 +490,127 @@ for region in regions:
         logGroupNamePrefix = lza_log_group_name_prefix
         )
     
-    for log_group in response['logGroups']:
-        vprint(f"Deleting Log Group '{log_group['logGroupName']}'", VERBOSE_LOW)
-        logs.delete_log_group(logGroupName = log_group['logGroupName'])
+    if response['logGroups']:
+        for log_group in response['logGroups']:
+            vprint(f"Deleting Log Group '{log_group['logGroupName']}'", VERBOSE_LOW)
+            logs.delete_log_group(logGroupName = log_group['logGroupName'])
+    else:
+        vprint(f"There are no SSM parameters to delete!", VERBOSE_LOW)
+
+############################################################################
+#           Step 4: Delete the Root Account-specific stacks
+############################################################################
+vprint('\n' + '>'*10 + f" Step 4: Delete the Root Account-specific stacks ", VERBOSE_LOW)
+
+account_id = root_account
+stacks_deleted = False
+
+###########################################
+# Delete the root account stacks in regions
+for region in regions:
+    cloudformation = aws_sessions[(account_id, region)].client('cloudformation')
+    delete_waiter = cloudformation.get_waiter('stack_delete_complete')
+    stacks_deleted = False
+
+    for stack in lza_core_stacks + lza_root_stacks_in_region:
+        stack_name = f"{stack}-{account_id}-{region}"
+
+        this_stack_deleted = delete_stack(
+            cloudformation_client = cloudformation,
+            stack_name = stack_name,
+            wait_till_deleted = True,
+            waiter = delete_waiter
+        )
+        stacks_deleted = stacks_deleted or this_stack_deleted
+        stack_to_wait = stack_name
+
+    if not stacks_deleted:
+        vprint(f"There are no root account-specific stacks to delete in region {region}")
+
+###########################################
+#  Delete the root account stacks specific to 'us-east-1'
+region = 'us-east-1'
+cloudformation = aws_sessions[(account_id, region)].client('cloudformation')
+delete_waiter = cloudformation.get_waiter('stack_delete_complete')
+stacks_deleted = False
+
+for stack in lza_root_stacks_in_us_east_1:
+    stack_name = f"{stack}-{account_id}-{region}"
+
+    this_stack_deleted = delete_stack(
+        cloudformation_client = cloudformation,
+        stack_name = stack_name,
+        wait_till_deleted = True,
+        waiter = delete_waiter
+    )
+    stacks_deleted = stacks_deleted or this_stack_deleted
+    stack_to_wait = stack_name
+
+if not stacks_deleted:
+    vprint(f"There are no root account-specific stacks to delete in region {region}")
+
+###########################################
+#  Delete the CDKToolkit stack in the 'us-east-1' region
+stack_name = 'CDKToolkit'
+
+this_stack_deleted = delete_stack(
+    cloudformation_client = cloudformation,
+    stack_name = stack_name,
+    wait_till_deleted = True,
+    waiter = delete_waiter
+)
+
+if not this_stack_deleted:
+    vprint(f"There is no {stack_name} stack to delete!")
+
+############################################################################
+#           Step 5: Delete the Root-specific LZA S3 Buckets
+############################################################################
+vprint('\n' + '>'*10 + f" Step 5: Delete the Root-specific LZA S3 Buckets ", VERBOSE_LOW)
+
+buckets_to_delete = []
+if 'us-east-1' in regions:
+    extended_regions = regions
+else:
+    extended_regions = regions + ['us-east-1']
+    
+for region in extended_regions:
+    buckets_to_delete += [f"aws-accelerator-{bucket}-{account_id}-{region}" for bucket in lza_root_buckets]
+    buckets_to_delete += [f"cdk-accel-assets-{account_id}-{region}"]
+
+buckets_deleted = False
+
+s3_resource = aws_sessions[(root_account, 'us-east-1')].resource('s3')
+for bucket_name in buckets_to_delete:
+    delete_status = delete_bucket(s3_resource = s3_resource, bucket_name = bucket_name)
+    buckets_deleted = buckets_deleted or delete_status
+
+if not buckets_deleted:
+    vprint("No buckets deleted!", VERBOSE_LOW)
+
+############################################################################
+#      Step 6: Delete the Cost and Usage Report Definition
+############################################################################
+vprint('\n' + '>'*10 + f" Step 6: Delete the Cost and Usage Report Definition", VERBOSE_LOW)
+
+cost_usage = aws_sessions[(root_account, 'us-east-1')].client('cur')
+
+try:
+    vprint(f"Deleting Cost and Usage Report {lza_cost_usage_report_name} ...", VERBOSE_MEDIUM)
+    cost_usage.delete_report_definition(
+        ReportName = lza_cost_usage_report_name
+    )
+except ClientError as err:
+    vprint(f"\tCost and Usage Report {lza_cost_usage_report_name} Not Found!", VERBOSE_MEDIUM)
+    vprint('*'*20 + f"Error message:", VERBOSE_HIGH)
+    vprint(err, VERBOSE_HIGH)
 
 
 ############################################################################
-#                Phase 10: Rename the CodeCommit Repo
+#                Step 7: Rename the CodeCommit Repo
 ############################################################################
 for region in regions:
-    vprint('\n' + '='*30 + f" Phase 10: Rename the CodeCommit Repo in region '{region}' " + '='*30, VERBOSE_LOW)
+    vprint('\n' + '>'*10 + f" Step 7: Rename the CodeCommit Repo in region '{region}' ", VERBOSE_LOW)
 
     codecommit = aws_sessions[ (root_account, region) ].client('codecommit')
     
