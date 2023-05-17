@@ -6,23 +6,25 @@
 # Script in 6 steps:
 #       1: Delete the LZA SCPs
 #       2: For each account:
-#          2a: Delete the AWSAccelerator-xxxxx Stacks
-#          2b: Delete the AWSAccelerator-CDKToolkit stack
-#          2c: Delete the LZA S3 Buckets
-#          2d: Delete the LZA ECR Repository (CDK)
-#          2e: Delete the LZA KMS keys
+#          2a: Delete the 'AWSAccelerator-SessionManagerEC2Role' IAM role
+#          2b: Delete the AWSAccelerator-xxxxx Stacks
+#          2c: Delete the AWSAccelerator-CDKToolkit stack
+#          2d: Delete the LZA S3 Buckets
+#          2e: Delete the LZA ECR Repository (CDK)
+#          2f: Delete the LZA KMS keys
 #       3: Clean the 'Security' Account
 #       4: Delete the Root Account-specific stacks
 #       5: Delete the Root-specific LZA S3 Buckets
 #       6: Delete the Cost and Usage Report Definition
-#       7: Rename the CodeCommit Repo
+#       7: Delete the IAM Policy 'Default-Boundary-Policy'
+#       8: Rename the CodeCommit Repo
 #
 #  Please fill-in the Parameters section before running this script.
 #
 #  The context for execution of this script should already have a valid
 #    AWS authentication context: .aws/credentials and .aws/config
 #
-#  Version 1.3 - 2023-05-03
+#  Version 1.4 - 2023-05-17
 #  Author: Hicham El Alaoui - alaoui@it-pro.com
 #
 ############################################################################
@@ -74,6 +76,8 @@ lza_core_stacks = [
     "AWSAccelerator-NetworkVpcDnsStack",
     "AWSAccelerator-NetworkVpcEndpointsStack",
     "AWSAccelerator-SecurityResourcesStack",
+    "AWSAccelerator-SecurityAuditStack",
+    "AWSAccelerator-KeyStack",
     "AWSAccelerator-NetworkVpcStack",
     "AWSAccelerator-OperationsStack",
     "AWSAccelerator-NetworkPrepStack",
@@ -95,9 +99,16 @@ lza_root_stacks_in_us_east_1 = [
 
 lza_cdk_stack = 'AWSAccelerator-CDKToolkit'
 
+lza_session_manager_ec2_role = "AWSAccelerator-SessionManagerEC2Role"
+
 lza_buckets = [
-    "s3-access-logs",
-    "auditmgr"
+    "aws-accelerator-s3-access-logs",
+    "aws-accelerator-auditmgr",
+    "aws-accelerator-central-logs",
+    "aws-accelerator-elb-access-logs",
+    "aws-controltower-logs",
+    "aws-controltower-s3-access-logs",
+    "cdk-accel-assets",
 ]
 
 lza_root_buckets = [
@@ -145,7 +156,7 @@ def delete_stack(cloudformation_client, stack_name, wait_till_deleted=False, wai
         return False
 
     stack_status = stack_response['Stacks'][0]['StackStatus']
-    if stack_status not in ['CREATE_COMPLETE', 'UPDATE_COMPLETE']:
+    if stack_status not in ['CREATE_COMPLETE', 'UPDATE_COMPLETE', 'DELETE_FAILED']:
         vprint(f"\tStack {stack_name} has a status of '{stack_status}' which is not CREATE_COMPLETE nor UPDATE_COMPLETE. Skipping ...", VERBOSE_LOW)
         return False
     
@@ -175,6 +186,7 @@ def delete_bucket(s3_resource, bucket_name):
     try:
         vprint(f"\tDeleting all objects in bucket {bucket_name}", VERBOSE_MEDIUM)
         bucket_versioning = s3_resource.BucketVersioning(bucket_name)
+        versioning_status = bucket_versioning.status
     except ClientError as err:
         vprint('*'*20 + f" Bucket Not Found! Error message:", VERBOSE_MEDIUM)
         vprint(err, VERBOSE_MEDIUM)
@@ -182,7 +194,7 @@ def delete_bucket(s3_resource, bucket_name):
 
     try:
         bucket = s3_resource.Bucket(bucket_name)
-        if bucket_versioning.status == 'Enabled':
+        if versioning_status == 'Enabled':
             bucket.object_versions.delete()
         else:
             bucket.objects.all().delete()
@@ -304,6 +316,80 @@ def detach_and_delete_scp(organizations_client, policy_id, policy_name):
 
     return
 
+############################################################################
+# Delete an IAM Role:
+def delete_iam_role(iam_client, role_name):
+
+    # Detach all policies from this role:
+    try:
+        response = iam_client.list_attached_role_policies(RoleName = role_name)
+    except ClientError as err:
+        vprint(f"Role {role_name} not found! Error Message:", VERBOSE_MEDIUM)
+        vprint(err, VERBOSE_MEDIUM)
+        return False
+
+
+    policy_is_attached = False
+    if response['AttachedPolicies']:
+        for policy in response['AttachedPolicies']:
+            try:
+                vprint(f"\tDetaching SCP {role_name} from policy {policy['PolicyName']} ...", VERBOSE_MEDIUM)
+                iam_client.detach_role_policy(RoleName = role_name, PolicyArn = policy['PolicyArn'])
+            except ClientError as err:
+                vprint(f"Unable to detach SCP {role_name} from policy {policy['PolicyName']}. Error Message:", VERBOSE_LOW)
+                vprint(err, VERBOSE_LOW)
+                policy_is_attached = True
+    else:
+        policy_is_attached = False
+    
+    if policy_is_attached:
+        vprint(f"Unable to detach policies from {role_name}! Skipping ...", VERBOSE_LOW)
+        return
+
+    vprint(f"Deleting IAM Role {role_name} ...", VERBOSE_MEDIUM)
+    try:    
+        response = iam_client.get_role(RoleName=role_name)
+    except ClientError as err:
+        vprint('*'*20 + f" IAM Role {role_name} Not Found! Error message:", VERBOSE_MEDIUM)
+        vprint(err, VERBOSE_MEDIUM)
+        return False
+    else:
+        vprint(response, VERBOSE_HIGH)
+
+    try:    
+        iam_client.delete_role(RoleName=role_name)
+            
+    except ClientError as err:
+        vprint('*'*20 + f" Unable to delete IAM Role {role_name}. Error message:", VERBOSE_LOW)
+        vprint(err, VERBOSE_LOW)
+        return False
+    else:
+        return True
+
+
+############################################################################
+# Delete an IAM Policy:
+def delete_iam_policy(iam_client, policy_arn):
+    vprint(f"Deleting IAM Policy {policy_arn} ...", VERBOSE_MEDIUM)
+    try:    
+        response = iam_client.get_policy(PolicyArn=policy_arn)
+    except ClientError as err:
+        vprint('*'*20 + f" IAM Policy {policy_arn} Not Found! Error message:", VERBOSE_MEDIUM)
+        vprint(err, VERBOSE_MEDIUM)
+        return False
+    else:
+        vprint(response, VERBOSE_HIGH)
+
+    try:    
+        iam_client.delete_policy(PolicyArn=policy_arn)
+            
+    except ClientError as err:
+        vprint('*'*20 + f" Unable to delete IAM Policy {policy_arn}. Error message:", VERBOSE_LOW)
+        vprint(err, VERBOSE_LOW)
+        return False
+    else:
+        return True
+
 
 ############################################################################
 #                         Start of the Script
@@ -357,13 +443,32 @@ for region in regions:
 
     ############################################################################
 
-    for account_id, account_name in lza_non_root_accounts.items():
+    # for account_id, account_name in lza_non_root_accounts.items():
+    for account_id, account_name in all_lza_accounts:
         vprint('\n' + '='*80 + '\n' + ' '*5 + f"Cleaning Account {account_name} ({account_id}) in region {region}\n" + '='*80, VERBOSE_LOW)
         
         ############################################################################
-        #                 Step 2a: Delete the AWSAccelerator-xxxxx Stacks
+        #    Step 2a: Delete the 'AWSAccelerator-SessionManagerEC2Role' IAM role
         ############################################################################
-        vprint('\n' + '>'*10 + " Step 2a: Delete the LZA core stacks (AWSAccelerator-xxxxx) ", VERBOSE_LOW)
+        vprint('\n' + '>'*10 + " Step 2a: Delete the 'AWSAccelerator-SessionManagerEC2Role' IAM role ", VERBOSE_LOW)
+
+        iam = aws_sessions[(account_id, region)].client('iam')
+        role_name = f"{lza_session_manager_ec2_role}-{region}"
+        
+        role_deleted = delete_iam_role(
+            iam_client = iam,
+            role_name = role_name
+        )
+
+        if role_deleted:
+            vprint(f"IAM Role {role_name} deleted.", VERBOSE_LOW)
+        else:
+            vprint(f"There is no IAM Role {role_name} to delete!", VERBOSE_LOW)
+
+        ############################################################################
+        #                 Step 2b: Delete the AWSAccelerator-xxxxx Stacks
+        ############################################################################
+        vprint('\n' + '>'*10 + " Step 2b: Delete the LZA core stacks (AWSAccelerator-xxxxx) ", VERBOSE_LOW)
 
         cloudformation = aws_sessions[(account_id, region)].client('cloudformation')
         delete_waiter = cloudformation.get_waiter('stack_delete_complete')
@@ -393,6 +498,7 @@ for region in regions:
                 stack_to_wait = None
                 response = cloudformation.list_stacks(StackStatusFilter=['DELETE_IN_PROGRESS']) 
                 for stack in response['StackSummaries']:
+                    stack_name = stack['StackName']
                     if stack_name in stacks_to_delete:
                         stack_to_wait = stack_name
                         break
@@ -403,9 +509,49 @@ for region in regions:
             vprint(f"There are no LZA core stacks to delete in account '{account_name}'!", VERBOSE_LOW)
 
         ############################################################################
-        #           Step 2b: Delete the AWSAccelerator-CDKToolkit stack
+        #         Step 2b-2: Delete the StackSet-AWSControlTower...... Stacks
         ############################################################################
-        vprint('\n' + '>'*10 + f" Step 2b: Delete the AWSAccelerator-CDKToolkit stack in account '{account_name}'", VERBOSE_LOW)
+        vprint('\n' + '>'*10 + " Step 2b-2: Delete the StackSet-AWSControlTower...... Stacks ", VERBOSE_LOW)
+
+        stacks_to_delete = []
+        stacks_deleted = False
+        stack_to_wait = None
+        response = cloudformation.list_stacks(StackStatusFilter=['CREATE_COMPLETE', 'UPDATE_COMPLETE', 'DELETE_FAILED']) 
+        for stack in response['StackSummaries']:
+            stack_name = stack['StackName']
+            if stack_name.startswith('StackSet-AWSControlTower'):
+                stacks_to_delete.append(stack_name)
+                this_stack_deleted = delete_stack(
+                    cloudformation_client=cloudformation,
+                    stack_name=stack_name,
+                    wait_till_deleted=False,
+                )
+            stacks_deleted = stacks_deleted or this_stack_deleted
+            stack_to_wait = stack_name
+
+        if stacks_deleted:
+            while stack_to_wait:
+                vprint(f"... Waiting for stack {stack_to_wait} to finish deleting (stack_to_wait = {stack_to_wait}) ...", VERBOSE_LOW)
+                delete_waiter.wait(StackName = stack_to_wait)
+                vprint(f"\tStack {stack_to_wait} completed deletion ...", VERBOSE_LOW)
+
+                # Check if there are other stack still being deleted
+                stack_to_wait = None
+                response = cloudformation.list_stacks(StackStatusFilter=['DELETE_IN_PROGRESS']) 
+                for stack in response['StackSummaries']:
+                    stack_name = stack['StackName']
+                    if stack_name in stacks_to_delete:
+                        stack_to_wait = stack_name
+                        break
+            
+            vprint(f">>> StackSet-AWSControlTower...... Stacks were deleted ...", VERBOSE_LOW)
+        else:
+            vprint(f"There are no StackSet-AWSControlTower...... Stacks to delete in account '{account_name}'!", VERBOSE_LOW)
+
+        ############################################################################
+        #           Step 2c: Delete the AWSAccelerator-CDKToolkit stack
+        ############################################################################
+        vprint('\n' + '>'*10 + f" Step 2c: Delete the AWSAccelerator-CDKToolkit stack in account '{account_name}'", VERBOSE_LOW)
         stack_name = lza_cdk_stack
 
         this_stack_deleted = delete_stack(
@@ -419,12 +565,12 @@ for region in regions:
             vprint(f"There is no {stack_name} stack to delete!")
 
         ############################################################################
-        #           Step 2c: Delete the LZA S3 Buckets
+        #           Step 2d: Delete the LZA S3 Buckets
         ############################################################################
-        vprint('\n' + '>'*10 + f" Step 2c: Delete the LZA S3 Buckets in account '{account_name}'", VERBOSE_LOW)
+        vprint('\n' + '>'*10 + f" Step 2d: Delete the LZA S3 Buckets in account '{account_name}'", VERBOSE_LOW)
         
-        buckets_to_delete = [f"aws-accelerator-{bucket}-{account_id}-{region}" for bucket in lza_buckets]
-        buckets_to_delete += [f"cdk-accel-assets-{account_id}-{region}"]
+        buckets_to_delete = [f"{bucket}-{account_id}-{region}" for bucket in lza_buckets]
+        # buckets_to_delete += [f"cdk-accel-assets-{account_id}-{region}"]
         buckets_deleted = False
 
         s3_resource = aws_sessions[(account_id, region)].resource('s3')
@@ -436,9 +582,9 @@ for region in regions:
             vprint("No buckets deleted!", VERBOSE_LOW)
 
         ############################################################################
-        #           Step 2d: Delete the LZA ECR Repository (CDK)
+        #           Step 2e: Delete the LZA ECR Repository (CDK)
         ############################################################################
-        vprint('\n' + '>'*10 + f" Step 2d: Delete the LZA ECR Repository (CDK) in account '{account_name}'", VERBOSE_LOW)
+        vprint('\n' + '>'*10 + f" Step 2e: Delete the LZA ECR Repository (CDK) in account '{account_name}'", VERBOSE_LOW)
 
         ecr = aws_sessions[(account_id, region)].client('ecr')
         cdk_repo = f"cdk-accel-container-assets-{account_id}-{region}"
@@ -448,9 +594,9 @@ for region in regions:
             vprint(f"There is no LZA ECR Repository (CDK)!", VERBOSE_LOW)
         
         ############################################################################
-        #           Step 2e: Delete the LZA KMS keys
+        #           Step 2f: Delete the LZA KMS keys
         ############################################################################
-        vprint('\n' + '>'*10 + f" Step 2e: Delete the LZA KMS keys in account '{account_name}'", VERBOSE_LOW)
+        vprint('\n' + '>'*10 + f" Step 2f: Delete the LZA KMS keys in account '{account_name}'", VERBOSE_LOW)
 
         kms = aws_sessions[(account_id, region)].client('kms')
 
@@ -551,17 +697,17 @@ if not stacks_deleted:
 
 ###########################################
 #  Delete the CDKToolkit stack in the 'us-east-1' region
-stack_name = 'CDKToolkit'
+# stack_name = 'CDKToolkit'
 
-this_stack_deleted = delete_stack(
-    cloudformation_client = cloudformation,
-    stack_name = stack_name,
-    wait_till_deleted = True,
-    waiter = delete_waiter
-)
+# this_stack_deleted = delete_stack(
+#     cloudformation_client = cloudformation,
+#     stack_name = stack_name,
+#     wait_till_deleted = True,
+#     waiter = delete_waiter
+# )
 
-if not this_stack_deleted:
-    vprint(f"There is no {stack_name} stack to delete!")
+# if not this_stack_deleted:
+#     vprint(f"There is no {stack_name} stack to delete!", VERBOSE_LOW)
 
 ############################################################################
 #           Step 5: Delete the Root-specific LZA S3 Buckets
@@ -607,10 +753,30 @@ except ClientError as err:
 
 
 ############################################################################
-#                Step 7: Rename the CodeCommit Repo
+#           Step 7: Delete the IAM Policy 'Default-Boundary-Policy'
+############################################################################
+vprint('\n' + '>'*10 + f" Step 7: Delete the IAM Policy 'Default-Boundary-Policy' ", VERBOSE_LOW)
+
+region = 'us-east-1'
+iam = aws_sessions[(root_account, region)].client('iam')
+
+policy_arn = f"arn:aws:iam::{root_account}:policy/Default-Boundary-Policy"
+
+policy_deleted = delete_iam_policy(
+    iam_client = iam,
+    policy_arn = policy_arn
+)
+
+if policy_deleted:
+    vprint(f"IAM Policy {policy_arn} deleted.", VERBOSE_LOW)
+else:
+    vprint(f"There is no IAM Policy {policy_arn} to delete!", VERBOSE_LOW)
+
+############################################################################
+#                Step 8: Rename the CodeCommit Repo
 ############################################################################
 for region in regions:
-    vprint('\n' + '>'*10 + f" Step 7: Rename the CodeCommit Repo in region '{region}' ", VERBOSE_LOW)
+    vprint('\n' + '>'*10 + f" Step 8: Rename the CodeCommit Repo in region '{region}' ", VERBOSE_LOW)
 
     codecommit = aws_sessions[ (root_account, region) ].client('codecommit')
     
