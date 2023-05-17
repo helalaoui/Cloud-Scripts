@@ -3,7 +3,7 @@
 #
 #    ******************   USE AT YOUR OWN RISK !!! *****************
 #
-# Script in 6 steps:
+# Script in 8 steps:
 #       1: Delete the LZA SCPs
 #       2: For each account:
 #          2a: Delete the 'AWSAccelerator-SessionManagerEC2Role' IAM role
