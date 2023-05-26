@@ -2,7 +2,7 @@
 #                   Pipeline to Wipe Out the Azure Landing Zone
 #
 # Author: Hicham El Alaoui alaoui@it-pro.com
-# Version 1.5 - 2023-04-27
+# Version 1.6 - 2023-05-26
 ################################################################################
 trigger: none
 
@@ -14,7 +14,7 @@ variables:
 
 parameters:
   - name: runPhase1
-    displayName: Delete All Resource Groups that are in the scope of this Landing Zone?
+    displayName: Delete All Resource Groups that have the correct landing zone suffix?
     type: boolean
     default: false
   - name: runPhase2
@@ -65,8 +65,10 @@ stages:
               --run-phase-2=False \
               --run-phase-3=False \
               --tenant-id=$(var-tenantId) \
+              --rg-name-suffix=$(var-platform-short-env-name)-$(var-platform-short-region-name)$(var-platform-iteration) \
               --org-top-mgmt-group-id=$(var-organisation-id) \
-              --rg-name-suffix=$(var-platform-short-region-name)$(var-platform-iteration) \
+              --check-org-tag=${{ parameters.checkTagsBeforeDelete }} \
+              --org-tag=$(var-common-tags-nom-système)
           )
           echo "+++++++++ DEBUG - Python Script Output ++++++++++++++++++"
           echo "$pythonOut"
@@ -131,7 +133,7 @@ stages:
             --run-phase-2=False \
             --run-phase-3=False \
             --tenant-id=$(var-tenantId) \
-            --rg-name-suffix=$(var-platform-short-region-name)$(var-platform-iteration) \
+            --rg-name-suffix=$(var-platform-short-env-name)-$(var-platform-short-region-name)$(var-platform-iteration) \
             --org-top-mgmt-group-id=$(var-organisation-id) \
             --check-org-tag=${{ parameters.checkTagsBeforeDelete }} \
             --org-tag=$(var-common-tags-nom-système)

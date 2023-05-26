@@ -5,8 +5,7 @@
 #
 # Script in 3 phases:
 #   - Phase 1: Deletes Resource Groups whose name ends with the suffix that
-#              was specified in the parameters section below and that are under the
-#               top level management group of the organization
+#              was specified in the parameters section below.
 #   - Phase 1 Dry Run: Runs Phase 1 without actually deleting the resource groups.
 #                      Prints the list of resource groups that would be deleted.
 #   - Phase 2: Moves all subscriptions under The Root Management Group.
@@ -18,7 +17,7 @@
 #  The context for execution of this script should already have a valid
 #    Azure authentication context (e.g. Azure CLI az login already done).
 #
-#  Version 1.5 - 2023-04-27
+#  Version 1.6 - 2023-05-26
 #  Author: Hicham El Alaoui - alaoui@it-pro.com
 ############################################################################
 
@@ -183,6 +182,7 @@ all_mgmt_groups = [group for group in mg_client.entities.list()]
 #   - the list of subscriptions which are under the organization's top management group
 #   - the root mgmt group
 wipe_out_scope = organization_top_mgmt_group_id
+
 subscriptions_in_scope = []
 vprint(f"Scrolling all mgmt groups to identify the root mgmt group and the subscription that are in the scope ...", VERBOSE_MEDIUM)
 for group in all_mgmt_groups:
@@ -220,12 +220,13 @@ if run_phase['Phase 1']:
     subscriptions_to_wipe = []
     rg_delete_count = 0
 
-    for sub in subscriptions_in_scope:
-        vprint(f"Subscription: {sub['name']}:")
+    for sub in all_subscriptions: 
+        # We need to loop on all_subscriptions because the subscriptions might have been moved manually out of the organization mgmt group. 
+        vprint(f"Subscription: {sub.display_name}:")
         vprint(sub, VERBOSE_HIGH)
         
         # Retrieve the list of resource groups of this subscription
-        resource_client = ResourceManagementClient(credential, sub['id'])
+        resource_client = ResourceManagementClient(credential, sub.subscription_id)
 
         # Filter resource groups that have the right suffix. If one found, this makes 
         # the current subscription a target subscription
@@ -277,7 +278,7 @@ if run_phase['Phase 1']:
                 network_watcher_rg_candidate = group
             
         if not target_groups:
-            vprint(f"... No target resource groups in Subscription {sub['name']}. Skipping ...")
+            vprint(f"... No target resource groups in Subscription {sub.display_name}. Skipping ...")
             continue
         
         # Else, (if there are target resource groups in this subscription) then this is a subscription to wipe
@@ -290,8 +291,8 @@ if run_phase['Phase 1']:
         # Build the list of target subscriptions and their target groups
         subscriptions_to_wipe.append(
                 {
-                    'name': sub['name'],
-                    'id': sub['id'],
+                    'name': sub.display_name,
+                    'id': sub.subscription_id,
                     'resource_groups': target_groups,
                     'resource_client': resource_client
                 }
@@ -311,7 +312,7 @@ if run_phase['Phase 1']:
 
             if user_input == 'yes':
                 for sub in subscriptions_to_wipe:
-                    vprint("Subscription: " + sub['name'])
+                    vprint("Subscription: " + sub.display_name)
                     vprint(sub, VERBOSE_HIGH)
                     
                     # Delete resource groups
