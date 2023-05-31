@@ -17,7 +17,7 @@
 #  The context for execution of this script should already have a valid
 #    Azure authentication context (e.g. Azure CLI az login already done).
 #
-#  Version 1.6 - 2023-05-26
+#  Version 1.6.1 - 2023-05-31
 #  Author: Hicham El Alaoui - alaoui@it-pro.com
 ############################################################################
 
@@ -312,7 +312,7 @@ if run_phase['Phase 1']:
 
             if user_input == 'yes':
                 for sub in subscriptions_to_wipe:
-                    vprint("Subscription: " + sub.display_name)
+                    vprint("Subscription: " + sub['name'], VERBOSE_LOW)
                     vprint(sub, VERBOSE_HIGH)
                     
                     # Delete resource groups
