@@ -4,35 +4,41 @@
 #    ******************   USE AT YOUR OWN RISK !!! *****************
 #
 # Script in 8 steps:
-#       1: Delete the LZA SCPs
+#       1a: Delete the LZA SCPs
+#       1b: Delete the IPAM on the Network Account
+#       1c: Unshare and Delete the Directories in the Operations Account
 #       2: For each account:
 #          2a: Delete the 'AWSAccelerator-SessionManagerEC2Role' IAM role
 #          2b: Delete the AWSAccelerator-xxxxx Stacks
-#          2c: Delete the AWSAccelerator-CDKToolkit stack
+#          (Skipped) 2c: Delete the AWSAccelerator-CDKToolkit stack
 #          2d: Delete the LZA S3 Buckets
-#          2e: Delete the LZA ECR Repository (CDK)
+#          (Skipped) 2e: Delete the LZA ECR Repository (CDK)
 #          2f: Delete the LZA KMS keys
+#          2g: Delete the LZA Log Groups
 #       3: Clean the 'Security' Account
 #       4: Delete the Root Account-specific stacks
 #       5: Delete the Root-specific LZA S3 Buckets
 #       6: Delete the Cost and Usage Report Definition
 #       7: Delete the IAM Policy 'Default-Boundary-Policy'
 #       8: Rename the CodeCommit Repo
+#       9: Remove service delegations
 #
 #  Please fill-in the Parameters section before running this script.
 #
 #  The context for execution of this script should already have a valid
 #    AWS authentication context: .aws/credentials and .aws/config
 #
-#  Version 1.4 - 2023-05-17
+#  Version 1.5 - 2023-06-02
 #  Author: Hicham El Alaoui - alaoui@it-pro.com
 #
 ############################################################################
 
 from datetime import datetime
+from time import sleep
 # AWS SDK for Python modules:
 import boto3
 from botocore.exceptions import ClientError
+
 
 # Constants - Do not modify
 VERBOSE_NONE   = 1
@@ -56,7 +62,15 @@ root_profile = "default"
 # The profile name references the section for that account in the .aws/config file.
 lza_non_root_accounts = {
     "11111111111": "Securite",
+    "22222222222": "Network",
+    "33333333333": "Operations"
 }
+
+# The network account that needs to be cleaned in step 1b:
+lza_network_account_id = "22222222222"
+
+# The operations account that needs to be cleaned in step 1c:
+lza_operations_account_id = "33333333333"
 
 # The security account that needs to be cleaned in step 5:
 lza_security_account_id = "11111111111"
@@ -82,24 +96,30 @@ lza_core_stacks = [
     "AWSAccelerator-OperationsStack",
     "AWSAccelerator-NetworkPrepStack",
     "AWSAccelerator-SecurityStack",
-    "AWSAccelerator-LoggingStack"
+    "AWSAccelerator-DependenciesStack",
+    "AWSAccelerator-LoggingStack",
 ]
 
 lza_root_stacks_in_region = [
     "AWSAccelerator-OrganizationsStack",
     "AWSAccelerator-PrepareStack",
     "AWSAccelerator-PipelineStack",
-    "awsaccelerator-installerstack"
 ]
+
+lza_installer_stack = "AWSAccelerator-InstallerStack"
 
 lza_root_stacks_in_us_east_1 = [
     "AWSAccelerator-FinalizeStack",
     "AWSAccelerator-AccountsStack"
 ]
 
-lza_cdk_stack = 'AWSAccelerator-CDKToolkit'
+#lza_cdk_stack = 'AWSAccelerator-CDKToolkit'
 
 lza_session_manager_ec2_role = "AWSAccelerator-SessionManagerEC2Role"
+
+lza_ipam_tag_name = "accelerator-ipam"
+
+lza_directory_name = "example.local"
 
 lza_buckets = [
     "aws-accelerator-s3-access-logs",
@@ -108,7 +128,7 @@ lza_buckets = [
     "aws-accelerator-elb-access-logs",
     "aws-controltower-logs",
     "aws-controltower-s3-access-logs",
-    "cdk-accel-assets",
+#    "cdk-accel-assets",
 ]
 
 lza_root_buckets = [
@@ -125,11 +145,19 @@ lza_scp_name_prefix = 'AWSAccelerator-'
 lza_tag_name = 'Accelerator'
 lza_tag_value = 'AWSAccelerator'
 
-lza_log_group_name_prefix = '/aws/lambda/AWSAccelerator'
+#lza_log_group_name_prefix = '/aws/lambda/AWSAccelerator'
 
 lza_cost_usage_report_name = 'accelerator-cur'
 
 lza_repository_name = 'aws-accelerator-config'
+
+lza_log_groups_prefixes = [
+    "/AWSAccelerator",
+    "/aws/codebuild/AWSAccelerator",
+    "/aws/lambda/AWSAccelerator",
+    "aws-accelerator",
+    "AWSAccelerator",
+]
 
 ############################################################################
 #                     End of LZA Internal Parameters
@@ -400,9 +428,9 @@ if lza_security_account_id not in lza_non_root_accounts:
     exit(1)
 
 ############################################################################
-#                 Step 1: Delete the LZA SCPs
+#                 Step 1a: Delete the LZA SCPs
 ############################################################################
-vprint('\n' + '>'*10 + " Step 1: Delete the LZA SCPs ", VERBOSE_LOW)
+vprint('\n' + '>'*10 + " Step 1a: Delete the LZA SCPs ", VERBOSE_LOW)
 
 organizations = boto3.client('organizations')
 response = organizations.list_policies(Filter='SERVICE_CONTROL_POLICY')
@@ -420,6 +448,72 @@ for policy in response['Policies']:
 if not lza_scp_found:
     vprint("There are no LZA SCPs to delete!", VERBOSE_LOW)
 
+############################################################################
+#          Step 1b: Delete the IPAM on the Network Account
+############################################################################
+vprint('\n' + '>'*10 + " Step 1b: Delete the IPAM on the Network Account ", VERBOSE_LOW)
+
+for region in regions:
+    aws_session = boto3.session.Session(profile_name = lza_non_root_accounts[lza_network_account_id], region_name = region)
+    ec2 = aws_session.client('ec2')
+        
+    response = ec2.describe_ipams(
+        Filters = [
+            {
+                'Name': "tag:Name",
+                'Values': [lza_ipam_tag_name]
+            }
+        ]
+    )
+
+    for ipam in response['Ipams']:
+        vprint(f"Deleting IPAM {ipam['IpamId']} in region {region} ...", VERBOSE_LOW)
+        delete_status = ec2.delete_ipam(
+            DryRun = False,
+            IpamId = ipam['IpamId'],
+            Cascade = True
+        )
+
+############################################################################
+#   Step 1c: Unshare and Delete the Directories in the Operations Account
+############################################################################
+vprint('\n' + '>'*10 + " Step 1c: Unshare and Delete the Directories in the Operations Account ", VERBOSE_LOW)
+
+for region in regions:
+    aws_session = boto3.session.Session(profile_name = lza_non_root_accounts[lza_operations_account_id], region_name = region)
+    directory_service = aws_session.client('ds')
+    
+    response = directory_service.describe_directories()
+
+    for directory in response['DirectoryDescriptions']:
+        vprint('-' * 40, VERBOSE_HIGH)
+        vprint(directory, VERBOSE_HIGH)
+        if directory['Name'] == lza_directory_name:
+            vprint(f"------- {directory['DirectoryId']}", VERBOSE_MEDIUM)
+            sharing_response = directory_service.describe_shared_directories(OwnerDirectoryId = directory['DirectoryId'])
+            
+            nb_shared_directories = len(sharing_response['SharedDirectories'])
+            for shared_directory in sharing_response['SharedDirectories']:
+                vprint(f"\t\tUnsharing shared directory: {shared_directory['SharedDirectoryId']}", VERBOSE_LOW)
+                vprint(shared_directory, VERBOSE_HIGH)
+                
+                unshare_response = directory_service.unshare_directory(
+                    DirectoryId = shared_directory['OwnerDirectoryId'],
+                    UnshareTarget={
+                        'Id': shared_directory['SharedAccountId'],
+                        'Type': 'ACCOUNT'
+                    }
+                )
+            
+            if nb_shared_directories:
+                WAIT_SECONDS = 2
+                # Wait WAIT_SECONDS seconds for each unshare operation.
+                timer = WAIT_SECONDS * nb_shared_directories
+                vprint(f"... Waiting {timer} seconds for the unshare operations to complete ...")
+                sleep(timer)
+
+            vprint(f"Deleting Directory {directory['DirectoryId']} ...", VERBOSE_LOW)
+            status = directory_service.delete_directory(DirectoryId = directory['DirectoryId'])
 
 ############################################################################
 #                                  Step 2
@@ -475,6 +569,7 @@ for region in regions:
         
         stacks_to_delete = []
         stacks_deleted = False
+        this_stack_deleted = False
         stack_to_wait = None
         for stack in lza_core_stacks:
             stack_name = f"{stack}-{account_id}-{region}"
@@ -515,6 +610,7 @@ for region in regions:
 
         stacks_to_delete = []
         stacks_deleted = False
+        this_stack_deleted = False
         stack_to_wait = None
         response = cloudformation.list_stacks(StackStatusFilter=['CREATE_COMPLETE', 'UPDATE_COMPLETE', 'DELETE_FAILED']) 
         for stack in response['StackSummaries']:
@@ -551,18 +647,18 @@ for region in regions:
         ############################################################################
         #           Step 2c: Delete the AWSAccelerator-CDKToolkit stack
         ############################################################################
-        vprint('\n' + '>'*10 + f" Step 2c: Delete the AWSAccelerator-CDKToolkit stack in account '{account_name}'", VERBOSE_LOW)
-        stack_name = lza_cdk_stack
+        # vprint('\n' + '>'*10 + f" Step 2c: Delete the AWSAccelerator-CDKToolkit stack in account '{account_name}'", VERBOSE_LOW)
+        # stack_name = lza_cdk_stack
 
-        this_stack_deleted = delete_stack(
-            cloudformation_client = cloudformation,
-            stack_name = stack_name,
-            wait_till_deleted = True,
-            waiter = delete_waiter
-        )
+        # this_stack_deleted = delete_stack(
+        #     cloudformation_client = cloudformation,
+        #     stack_name = stack_name,
+        #     wait_till_deleted = True,
+        #     waiter = delete_waiter
+        # )
     
-        if not this_stack_deleted:
-            vprint(f"There is no {stack_name} stack to delete!")
+        # if not this_stack_deleted:
+        #     vprint(f"There is no {stack_name} stack to delete!")
 
         ############################################################################
         #           Step 2d: Delete the LZA S3 Buckets
@@ -584,14 +680,14 @@ for region in regions:
         ############################################################################
         #           Step 2e: Delete the LZA ECR Repository (CDK)
         ############################################################################
-        vprint('\n' + '>'*10 + f" Step 2e: Delete the LZA ECR Repository (CDK) in account '{account_name}'", VERBOSE_LOW)
+        # vprint('\n' + '>'*10 + f" Step 2e: Delete the LZA ECR Repository (CDK) in account '{account_name}'", VERBOSE_LOW)
 
-        ecr = aws_sessions[(account_id, region)].client('ecr')
-        cdk_repo = f"cdk-accel-container-assets-{account_id}-{region}"
+        # ecr = aws_sessions[(account_id, region)].client('ecr')
+        # cdk_repo = f"cdk-accel-container-assets-{account_id}-{region}"
         
-        repo_deleted = delete_ecr_repo(ecr_client = ecr, repo_name = cdk_repo)
-        if not repo_deleted:
-            vprint(f"There is no LZA ECR Repository (CDK)!", VERBOSE_LOW)
+        # repo_deleted = delete_ecr_repo(ecr_client = ecr, repo_name = cdk_repo)
+        # if not repo_deleted:
+        #     vprint(f"There is no LZA ECR Repository (CDK)!", VERBOSE_LOW)
         
         ############################################################################
         #           Step 2f: Delete the LZA KMS keys
@@ -601,6 +697,26 @@ for region in regions:
         kms = aws_sessions[(account_id, region)].client('kms')
 
         delete_keys_by_tag(kms_client = kms, target_tag_name = lza_tag_name, target_tag_value = lza_tag_value)
+
+        ############################################################################
+        #                Step 2g: Delete Log Groups
+        ############################################################################
+        vprint('\n' + '>'*10 + f" Step 2g: Delete Log Groups in account {account_name} in region '{region}' ", VERBOSE_LOW)
+        
+        cloudwatch = aws_sessions[(account_id, region)].client('logs')
+
+        for prefix in lza_log_groups_prefixes:
+            response = cloudwatch.describe_log_groups(
+                logGroupNamePrefix = prefix,
+                limit = 50,
+                includeLinkedAccounts = False
+            )
+
+        for log_group in response['logGroups']:
+            vprint(f"\tDeleting Log Group '{log_group['logGroupName']}'", VERBOSE_LOW)
+            cloudwatch.delete_log_group(logGroupName = log_group['logGroupName'])
+
+
         
 # Separator (End of core accounts cleaning)
 vprint('\n' + '='*80, VERBOSE_LOW)
@@ -630,18 +746,18 @@ for region in regions:
     else:
         vprint(f"There are no SSM parameters to delete!", VERBOSE_LOW)
 
-    logs = aws_sessions[ (lza_security_account_id, region) ].client('logs')
+    # logs = aws_sessions[ (lza_security_account_id, region) ].client('logs')
     
-    response = logs.describe_log_groups(
-        logGroupNamePrefix = lza_log_group_name_prefix
-        )
+    # response = logs.describe_log_groups(
+    #     logGroupNamePrefix = lza_log_group_name_prefix
+    #     )
     
-    if response['logGroups']:
-        for log_group in response['logGroups']:
-            vprint(f"Deleting Log Group '{log_group['logGroupName']}'", VERBOSE_LOW)
-            logs.delete_log_group(logGroupName = log_group['logGroupName'])
-    else:
-        vprint(f"There are no SSM parameters to delete!", VERBOSE_LOW)
+    # if response['logGroups']:
+    #     for log_group in response['logGroups']:
+    #         vprint(f"Deleting Log Group '{log_group['logGroupName']}'", VERBOSE_LOW)
+    #         logs.delete_log_group(logGroupName = log_group['logGroupName'])
+    # else:
+    #     vprint(f"There are no SSM parameters to delete!", VERBOSE_LOW)
 
 ############################################################################
 #           Step 4: Delete the Root Account-specific stacks
@@ -650,6 +766,7 @@ vprint('\n' + '>'*10 + f" Step 4: Delete the Root Account-specific stacks ", VER
 
 account_id = root_account
 stacks_deleted = False
+this_stack_deleted = False
 
 ###########################################
 # Delete the root account stacks in regions
@@ -657,6 +774,7 @@ for region in regions:
     cloudformation = aws_sessions[(account_id, region)].client('cloudformation')
     delete_waiter = cloudformation.get_waiter('stack_delete_complete')
     stacks_deleted = False
+    this_stack_deleted = False
 
     for stack in lza_core_stacks + lza_root_stacks_in_region:
         stack_name = f"{stack}-{account_id}-{region}"
@@ -668,7 +786,17 @@ for region in regions:
             waiter = delete_waiter
         )
         stacks_deleted = stacks_deleted or this_stack_deleted
-        stack_to_wait = stack_name
+
+    # Delete the LZA Installer Stack
+    stack_name = lza_installer_stack
+
+    this_stack_deleted = delete_stack(
+        cloudformation_client = cloudformation,
+        stack_name = stack_name,
+        wait_till_deleted = True,
+        waiter = delete_waiter
+    )
+    stacks_deleted = stacks_deleted or this_stack_deleted
 
     if not stacks_deleted:
         vprint(f"There are no root account-specific stacks to delete in region {region}")
@@ -679,6 +807,7 @@ region = 'us-east-1'
 cloudformation = aws_sessions[(account_id, region)].client('cloudformation')
 delete_waiter = cloudformation.get_waiter('stack_delete_complete')
 stacks_deleted = False
+this_stack_deleted = False
 
 for stack in lza_root_stacks_in_us_east_1:
     stack_name = f"{stack}-{account_id}-{region}"
@@ -722,7 +851,7 @@ else:
     
 for region in extended_regions:
     buckets_to_delete += [f"aws-accelerator-{bucket}-{account_id}-{region}" for bucket in lza_root_buckets]
-    buckets_to_delete += [f"cdk-accel-assets-{account_id}-{region}"]
+    # buckets_to_delete += [f"cdk-accel-assets-{account_id}-{region}"]
 
 buckets_deleted = False
 
@@ -790,6 +919,29 @@ for region in regions:
         new_name = lza_repository_name + '_' + now.strftime("%Y-%m-%d_%Hh%Mm%Ss")
         vprint(f"Renaming the '{lza_repository_name}' repository to '{new_name}'")
         codecommit.update_repository_name(oldName = lza_repository_name, newName = new_name)
+
+############################################################################
+#                Step 9: Remove service delegations
+############################################################################
+for region in regions:
+    for account_id, account_name in all_lza_accounts:
+        vprint('\n' + '>'*10 + f" Step 9: Remove service delegations in account {account_name} in region '{region}' ", VERBOSE_LOW)
+
+        organizations = aws_sessions[(root_account, region)].client('organizations')
+        
+        try:
+            response = organizations.list_delegated_services_for_account(AccountId = account_id)
+        except ClientError as err:
+            vprint(f"\tNo delegated services in Account {account_name}", VERBOSE_MEDIUM)
+        else:
+            for delegated_service in response['DelegatedServices']:
+                service = delegated_service['ServicePrincipal']
+                
+                vprint(f"Removing service delegation for account {account_name} on service {service}", VERBOSE_LOW)
+                organizations.deregister_delegated_administrator(
+                    AccountId = account_id,
+                    ServicePrincipal = service
+                )
 
 
 
