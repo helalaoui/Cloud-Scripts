@@ -3,12 +3,19 @@
 #
 #    ******************   USE AT YOUR OWN RISK !!! *****************
 #
+# Script steps:
+#       1: For each account:
+#          1a: Delete the AWSAccelerator-CDKToolkit stack
+#          1b: Delete the LZA S3 Buckets
+#          1c: Delete the LZA ECR Repository (CDK)
+#       2: Delete the Root-specific LZA S3 Buckets
+#
 #  Please fill-in the Parameters section before running this script.
 #
 #  The context for execution of this script should already have a valid
 #    AWS authentication context: .aws/credentials and .aws/config
 #
-#  Version 1.4 - 2023-05-17
+#  Version 1.5 - 2023-06-05
 #  Author: Hicham El Alaoui - alaoui@it-pro.com
 #
 ############################################################################
@@ -63,7 +70,9 @@ requested_verbose_level = VERBOSE_LOW
 
 lza_cdk_stack = 'AWSAccelerator-CDKToolkit'
 
-lza_cdk_bucket = "cdk-accel-assets"
+lza_cdk_bucket = 'cdk-accel-assets'
+
+lza_cdk_repo = 'cdk-accel-container-assets'
 
 ############################################################################
 #                     End of LZA Internal Parameters
@@ -140,7 +149,29 @@ def delete_bucket(s3_resource, bucket_name):
         return False
     else:
         return True
-    
+
+############################################################################
+# Delete an ECR repository:
+def delete_ecr_repo(ecr_client, repo_name):
+    vprint(f"Deleting ECR Repository {repo_name} ...", VERBOSE_MEDIUM)
+    try:    
+        response = ecr_client.describe_repositories(repositoryNames = [repo_name])
+    except ClientError as err:
+        vprint('*'*20 + f" ECR Repository {repo_name} Not Found! Error message:", VERBOSE_MEDIUM)
+        vprint(err, VERBOSE_MEDIUM)
+        return False
+
+    try:    
+        ecr_client.delete_repository(repositoryName=repo_name, force=True)
+            
+    except ClientError as err:
+        vprint('*'*20 + f" Unable to delete ECR repository {repo_name}. Error message:", VERBOSE_LOW)
+        vprint(err, VERBOSE_LOW)
+        return False
+    else:
+        return True
+
+
 ############################################################################
 #                         Start of the Script
 ############################################################################
@@ -168,7 +199,7 @@ for region in regions:
         vprint('\n' + '='*80 + '\n' + ' '*5 + f"Cleaning Account {account_name} ({account_id}) in region {region}\n" + '='*80, VERBOSE_LOW)
         
         ############################################################################
-        #           Step 2c: Delete the AWSAccelerator-CDKToolkit stack
+        #           Step 1a: Delete the AWSAccelerator-CDKToolkit stack
         ############################################################################
         vprint('\n' + '>'*10 + f" Step 2c: Delete the AWSAccelerator-CDKToolkit stack in account '{account_name}'", VERBOSE_LOW)
         stack_name = lza_cdk_stack
@@ -187,11 +218,11 @@ for region in regions:
             vprint(f"There is no {stack_name} stack to delete!")
 
         ############################################################################
-        #           Step 2d: Delete the LZA S3 Buckets
+        #           Step 1b: Delete the LZA S3 Buckets
         ############################################################################
         vprint('\n' + '>'*10 + f" Step 2d: Delete the LZA S3 Buckets in account '{account_name}'", VERBOSE_LOW)
         
-        bucket_to_delete = f"cdk-accel-assets-{account_id}-{region}"
+        bucket_to_delete = f"{lza_cdk_bucket}-{account_id}-{region}"
 
         s3_resource = aws_sessions[(account_id, region)].resource('s3')
         bucket_deleted = delete_bucket(s3_resource = s3_resource, bucket_name = bucket_to_delete)
@@ -200,35 +231,20 @@ for region in regions:
             vprint(f"\tCDK Bucket {bucket_to_delete} deleted in Account {account_name}.", VERBOSE_LOW)
 
         ############################################################################
-        #           Step 2e: Delete the LZA ECR Repository (CDK)
+        #           Step 1c: Delete the LZA ECR Repository (CDK)
         ############################################################################
         vprint('\n' + '>'*10 + f" Step 2e: Delete the LZA ECR Repository (CDK) in account '{account_name}'", VERBOSE_LOW)
 
         ecr = aws_sessions[(account_id, region)].client('ecr')
-        cdk_repo = f"cdk-accel-container-assets-{account_id}-{region}"
+        cdk_repo = f"{lza_cdk_repo}-{account_id}-{region}"
         
         repo_deleted = delete_ecr_repo(ecr_client = ecr, repo_name = cdk_repo)
         if not repo_deleted:
             vprint(f"There is no LZA ECR Repository (CDK)!", VERBOSE_LOW)
         
 
-
-###########################################
-#  Delete the CDKToolkit stack in the 'us-east-1' region
-# stack_name = 'CDKToolkit'
-
-# this_stack_deleted = delete_stack(
-#     cloudformation_client = cloudformation,
-#     stack_name = stack_name,
-#     wait_till_deleted = True,
-#     waiter = delete_waiter
-# )
-
-# if not this_stack_deleted:
-#     vprint(f"There is no {stack_name} stack to delete!", VERBOSE_LOW)
-
 ############################################################################
-#           Step 5: Delete the Root-specific LZA S3 Buckets
+#           Step 2: Delete the Root-specific LZA S3 Buckets
 ############################################################################
 vprint('\n' + '>'*10 + f" Step 5: Delete the Root-specific LZA S3 Buckets ", VERBOSE_LOW)
 
@@ -239,7 +255,7 @@ else:
     extended_regions = regions + ['us-east-1']
     
 for region in extended_regions:
-    buckets_to_delete += [f"cdk-accel-assets-{root_account}-{region}"]
+    buckets_to_delete += [f"{lza_cdk_bucket}-{root_account}-{region}"]
 
 buckets_deleted = False
 
@@ -254,3 +270,4 @@ if not buckets_deleted:
 
 
 vprint(f"\nAWS LZA Wipe-Out Ended", VERBOSE_LOW)
+

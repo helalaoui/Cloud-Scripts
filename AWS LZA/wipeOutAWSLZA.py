@@ -3,14 +3,13 @@
 #
 #    ******************   USE AT YOUR OWN RISK !!! *****************
 #
-# Script in 8 steps:
+# Script in steps:
 #       1a: Delete the LZA SCPs
 #       1b: Delete the IPAM on the Network Account
-#       1c: Unshare and Delete the Directories in the Operations Account
+#       1c: Clean the Operations Account
 #       2: For each account:
 #          2a: Delete the 'AWSAccelerator-SessionManagerEC2Role' IAM role
 #          2b: Delete the AWSAccelerator-xxxxx Stacks
-#          (Skipped) 2c: Delete the AWSAccelerator-CDKToolkit stack
 #          2d: Delete the LZA S3 Buckets
 #          (Skipped) 2e: Delete the LZA ECR Repository (CDK)
 #          2f: Delete the LZA KMS keys
@@ -38,7 +37,6 @@ from time import sleep
 # AWS SDK for Python modules:
 import boto3
 from botocore.exceptions import ClientError
-
 
 # Constants - Do not modify
 VERBOSE_NONE   = 1
@@ -475,12 +473,20 @@ for region in regions:
         )
 
 ############################################################################
-#   Step 1c: Unshare and Delete the Directories in the Operations Account
+#                 Step 1c: Clean the Operations Account
+# - Unshare and Delete the Directories
+# - Delete the LZA Managed Active Directory secrets
 ############################################################################
-vprint('\n' + '>'*10 + " Step 1c: Unshare and Delete the Directories in the Operations Account ", VERBOSE_LOW)
+vprint('\n' + '>'*10 + " Step 1c: Clean the Operations Account ", VERBOSE_LOW)
+
+account_name = lza_non_root_accounts[lza_operations_account_id]
 
 for region in regions:
-    aws_session = boto3.session.Session(profile_name = lza_non_root_accounts[lza_operations_account_id], region_name = region)
+    aws_session = boto3.session.Session(profile_name = account_name, region_name = region)
+
+    #########################################
+    # Unshare and Delete the Directories
+
     directory_service = aws_session.client('ds')
     
     response = directory_service.describe_directories()
@@ -514,6 +520,33 @@ for region in regions:
 
             vprint(f"Deleting Directory {directory['DirectoryId']} ...", VERBOSE_LOW)
             status = directory_service.delete_directory(DirectoryId = directory['DirectoryId'])
+
+
+    ##########################################
+    # Delete the LZA Managed Active Directory secrets
+
+    secrets_manager = aws_session.client('secretsmanager')
+    response = secrets_manager.list_secrets(
+        Filters=[
+            {
+                'Key': 'name',
+                'Values': ['/accelerator']
+            },
+        ],
+    )
+
+    if response['SecretList']:
+        vprint(f"Deleting LZA Managed Active Directory secrets in the Operations Account '{account_name}'", VERBOSE_LOW)
+        for secret in response['SecretList']:
+            secrets_manager.delete_secret(
+                SecretId = secret['ARN'],
+                ForceDeleteWithoutRecovery = True
+            )
+    else:
+        vprint("No secrets to delete!", VERBOSE_LOW)
+
+
+exit(0)
 
 ############################################################################
 #                                  Step 2
@@ -643,22 +676,6 @@ for region in regions:
             vprint(f">>> StackSet-AWSControlTower...... Stacks were deleted ...", VERBOSE_LOW)
         else:
             vprint(f"There are no StackSet-AWSControlTower...... Stacks to delete in account '{account_name}'!", VERBOSE_LOW)
-
-        ############################################################################
-        #           Step 2c: Delete the AWSAccelerator-CDKToolkit stack
-        ############################################################################
-        # vprint('\n' + '>'*10 + f" Step 2c: Delete the AWSAccelerator-CDKToolkit stack in account '{account_name}'", VERBOSE_LOW)
-        # stack_name = lza_cdk_stack
-
-        # this_stack_deleted = delete_stack(
-        #     cloudformation_client = cloudformation,
-        #     stack_name = stack_name,
-        #     wait_till_deleted = True,
-        #     waiter = delete_waiter
-        # )
-    
-        # if not this_stack_deleted:
-        #     vprint(f"There is no {stack_name} stack to delete!")
 
         ############################################################################
         #           Step 2d: Delete the LZA S3 Buckets
