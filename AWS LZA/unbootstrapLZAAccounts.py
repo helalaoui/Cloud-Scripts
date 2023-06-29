@@ -15,7 +15,7 @@
 #  The context for execution of this script should already have a valid
 #    AWS authentication context: .aws/credentials and .aws/config
 #
-#  Version 1.5 - 2023-06-05
+#  Version 1.6 - 2023-06-12
 #  Author: Hicham El Alaoui - alaoui@it-pro.com
 #
 ############################################################################
@@ -36,7 +36,7 @@ VERBOSE_HIGH   = 4
 ############################################################################
 
 regions = [
-    # "us-east-1",
+    "us-east-1",
     "ca-central-1",
 ]
 
@@ -50,15 +50,6 @@ lza_non_root_accounts = {
     "22222222222": "Network",
     "33333333333": "Operations"
 }
-
-# The network account that needs to be cleaned in step 1b:
-lza_network_account_id = "22222222222"
-
-# The operations account that needs to be cleaned in step 1c:
-lza_operations_account_id = "33333333333"
-
-# The security account that needs to be cleaned in step 5:
-lza_security_account_id = "11111111111"
 
 # Message verbose level you want. Options: VERBOSE_NONE, VERBOSE_LOW, VERBOSE_MEDIUM,
 #    or VERBOSE_HIGH. Recommended: VERBOSE_LOW.
@@ -176,32 +167,32 @@ def delete_ecr_repo(ecr_client, repo_name):
 #                         Start of the Script
 ############################################################################
 
+# Build the list of all accounts:
+all_lza_accounts = [(account_id, account_name) for account_id, account_name in lza_non_root_accounts.items()]
+all_lza_accounts.append((root_account, root_profile))
+vprint("All LZA Accounts:", VERBOSE_MEDIUM)
+vprint(all_lza_accounts, VERBOSE_MEDIUM)
+
+# Build the list of connections to all accounts in all regions:
 aws_sessions = {}
+
 aws_sessions[(root_account, 'us-east-1')] = boto3.session.Session(profile_name = root_profile, region_name = 'us-east-1')
 
-for region in regions:
-    
-    # Build the list of accounts:
-    all_lza_accounts = [(account_id, account_name) for account_id, account_name in lza_non_root_accounts.items()]
-    all_lza_accounts.append((root_account, root_profile))
-    vprint("All LZA Accounts:", VERBOSE_MEDIUM)
-    vprint(all_lza_accounts, VERBOSE_MEDIUM)
-    
-    
-    # Opening sessions for all the accounts and regions
+for region in regions:    
     for account_id, account_name in all_lza_accounts:
         aws_sessions[(account_id, region)] = boto3.session.Session(profile_name=account_name, region_name=region)
 
-    ############################################################################
-
-    # for account_id, account_name in lza_non_root_accounts.items():
+############################################################################
+#                 Step 1 For Each Account:
+############################################################################
+for region in regions:
     for account_id, account_name in all_lza_accounts:
         vprint('\n' + '='*80 + '\n' + ' '*5 + f"Cleaning Account {account_name} ({account_id}) in region {region}\n" + '='*80, VERBOSE_LOW)
         
         ############################################################################
         #           Step 1a: Delete the AWSAccelerator-CDKToolkit stack
         ############################################################################
-        vprint('\n' + '>'*10 + f" Step 2c: Delete the AWSAccelerator-CDKToolkit stack in account '{account_name}'", VERBOSE_LOW)
+        vprint('\n' + '>'*10 + f" Step 1a: Delete the AWSAccelerator-CDKToolkit stack in account '{account_name}'", VERBOSE_LOW)
         stack_name = lza_cdk_stack
 
         cloudformation = aws_sessions[(account_id, region)].client('cloudformation')
@@ -220,7 +211,7 @@ for region in regions:
         ############################################################################
         #           Step 1b: Delete the LZA S3 Buckets
         ############################################################################
-        vprint('\n' + '>'*10 + f" Step 2d: Delete the LZA S3 Buckets in account '{account_name}'", VERBOSE_LOW)
+        vprint('\n' + '>'*10 + f" Step 1b: Delete the LZA S3 Buckets in account '{account_name}'", VERBOSE_LOW)
         
         bucket_to_delete = f"{lza_cdk_bucket}-{account_id}-{region}"
 
@@ -233,7 +224,7 @@ for region in regions:
         ############################################################################
         #           Step 1c: Delete the LZA ECR Repository (CDK)
         ############################################################################
-        vprint('\n' + '>'*10 + f" Step 2e: Delete the LZA ECR Repository (CDK) in account '{account_name}'", VERBOSE_LOW)
+        vprint('\n' + '>'*10 + f" Step 1c: Delete the LZA ECR Repository (CDK) in account '{account_name}'", VERBOSE_LOW)
 
         ecr = aws_sessions[(account_id, region)].client('ecr')
         cdk_repo = f"{lza_cdk_repo}-{account_id}-{region}"
@@ -246,7 +237,7 @@ for region in regions:
 ############################################################################
 #           Step 2: Delete the Root-specific LZA S3 Buckets
 ############################################################################
-vprint('\n' + '>'*10 + f" Step 5: Delete the Root-specific LZA S3 Buckets ", VERBOSE_LOW)
+vprint('\n' + '>'*10 + f" Step 2: Delete the Root-specific LZA S3 Buckets ", VERBOSE_LOW)
 
 buckets_to_delete = []
 if 'us-east-1' in regions:
@@ -269,5 +260,5 @@ if not buckets_deleted:
 
 
 
-vprint(f"\nAWS LZA Wipe-Out Ended", VERBOSE_LOW)
+vprint(f"\nunbootstrapLZAAccounts script Ended.", VERBOSE_LOW)
 
