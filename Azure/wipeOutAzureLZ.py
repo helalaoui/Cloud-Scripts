@@ -4,8 +4,7 @@
 #    ******************   USE AT YOUR OWN RISK !!! *****************
 #
 # Script in 3 phases:
-#   - Phase 1: Deletes Resource Groups whose name ends with the suffix that
-#              was specified in the parameters section below.
+#   - Phase 1: Deletes Resource Groups whose name ends with a given suffix.
 #   - Phase 1 Dry Run: Runs Phase 1 without actually deleting the resource groups.
 #                      Prints the list of resource groups that would be deleted.
 #   - Phase 2: Moves all subscriptions under The Root Management Group.
@@ -17,7 +16,7 @@
 #  The context for execution of this script should already have a valid
 #    Azure authentication context (e.g. Azure CLI az login already done).
 #
-#  Version 1.6.1 - 2023-05-31
+#  Version 1.6.2 - 2023-06-28
 #  Author: Hicham El Alaoui - alaoui@it-pro.com
 ############################################################################
 
@@ -147,7 +146,7 @@ if len(resource_suffix) < 6:
     exit(1)
     
 # Acquire a credential object. If Run from an Azure CLI context (after "az login"), will take the credentials of Azure CLI.
-credential = DefaultAzureCredential()
+credential = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
 
 # List subscriptions.
 # Needed also to check the current tenant_id.

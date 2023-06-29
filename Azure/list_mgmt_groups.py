@@ -3,7 +3,7 @@ from azure.mgmt.resource import ResourceManagementClient, SubscriptionClient
 from azure.mgmt.managementgroups import ManagementGroupsAPI
 from azure.core.exceptions import ResourceNotFoundError
 
-credential = DefaultAzureCredential()
+credential = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
 
 mg_client = ManagementGroupsAPI(credential)
 
