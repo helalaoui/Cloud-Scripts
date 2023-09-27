@@ -16,7 +16,7 @@
 #  The context for execution of this script should already have a valid
 #    Azure authentication context (e.g. Azure CLI az login already done).
 #
-#  Version 1.6.2 - 2023-06-28
+#  Version 1.6.3 - 2023-08-24
 #  Author: Hicham El Alaoui - alaoui@it-pro.com
 ############################################################################
 
@@ -49,9 +49,9 @@ organization_tag_value = ''
 
 # Phases you want to run:
 run_phase = {
-    'Phase 1': True,
-    'Phase 2': True,
-    'Phase 3': True
+    'Phase 1': False,
+    'Phase 2': False,
+    'Phase 3': False,
 }
 
 # Message verbose level you want. Options: VERBOSE_NONE, VERBOSE_LOW, VERBOSE_MEDIUM,
@@ -68,6 +68,7 @@ import argparse
 
 from azure.identity import DefaultAzureCredential, AzureCliCredential
 from azure.mgmt.resource import ResourceManagementClient, SubscriptionClient
+from azure.mgmt.resource.locks import ManagementLockClient
 from azure.mgmt.managementgroups import ManagementGroupsAPI
 from azure.core.exceptions import ResourceNotFoundError
 
@@ -149,7 +150,6 @@ if len(resource_suffix) < 6:
 credential = DefaultAzureCredential(exclude_shared_token_cache_credential=True)
 
 # List subscriptions.
-# Needed also to check the current tenant_id.
 sub_client = SubscriptionClient(credential)
 vprint("Gathering the list of subscriptions and their resource groups ...\n")
 all_subscriptions = [item for item in sub_client.subscriptions.list()]
@@ -159,55 +159,64 @@ if not all_subscriptions:
     credential.close()
     exit(1)
 
-current_tenant_id = all_subscriptions[0].tenant_id
+# current_tenant_id = all_subscriptions[0].tenant_id
 
-# Check if we are on the right tenant:
-if current_tenant_id != target_tenant_id:
-    vprint("You are running this script from a tenant that is different from the specified tenant.")
-    vprint("Execution (runtime) tenant ID:    " + current_tenant_id)
-    vprint("Tenant ID parameter you provided: " + target_tenant_id)
-    vprint("Exiting ...")
-    credential.close()
-    exit(1)    
+# # Check if we are on the right tenant:
+# if current_tenant_id != target_tenant_id:
+#     vprint("You are running this script from a tenant that is different from the specified tenant.")
+#     vprint("Execution (runtime) tenant ID:    " + current_tenant_id)
+#     vprint("Tenant ID parameter you provided: " + target_tenant_id)
+#     vprint("Exiting ...")
+#     credential.close()
+#     exit(1)    
 
 ############################################################################
 #                  Collect the List of Target Subscriptions 
 ############################################################################
-root_mgmt_group = None
+#root_mgmt_group = None
 mg_client = ManagementGroupsAPI(credential)
 all_mgmt_groups = [group for group in mg_client.entities.list()]
 
-# Scroll all mgmt groups in order to identify:
-#   - the list of subscriptions which are under the organization's top management group
-#   - the root mgmt group
-wipe_out_scope = organization_top_mgmt_group_id
-
-subscriptions_in_scope = []
+tenant_subscriptions = []
+organization_subscriptions = []
 vprint(f"Scrolling all mgmt groups to identify the root mgmt group and the subscription that are in the scope ...", VERBOSE_MEDIUM)
 for group in all_mgmt_groups:
     vprint(f"Group: {group.name}\t{group.type}", VERBOSE_MEDIUM)
     vprint(group, VERBOSE_HIGH)
     # In the list here you have the entire hierarchical tree, including the subscriptions,
-    if group.type == 'Microsoft.Management/managementGroups':
+    # if group.type == 'Microsoft.Management/managementGroups':
 
-        # Identification of the Root Mgmt Group:
-        if not group.parent_name_chain and group.display_name == 'Tenant Root Group':
-            vprint(f"======Root Mgmt Group Identified: {group.name}", VERBOSE_MEDIUM)
-            root_mgmt_group = group
+        # # Identification of the Root Mgmt Group:
+        # # if not group.parent_name_chain and group.display_name == 'Tenant Root Group':
+        # if group.name == target_tenant_id:
+        #     vprint(f"======Root Mgmt Group Identified: {group.name}", VERBOSE_MEDIUM)
+        #     root_mgmt_group = group
 
-    elif group.type == '/subscriptions' : # This is a subscription
-        # Collect only the subscriptions which are under the organization top management group
+    if group.type == '/subscriptions' : # This is a subscription
+        # Collect only the subscriptions which are under the organization top management group or under the tenant_id
         # For that purpose we need to check the whole parent chain
         for parent in group.parent_name_chain:
-            if parent == wipe_out_scope:
-                subscriptions_in_scope.append(
+            
+            # 1st: Does this sub belong to the organization
+            if parent == organization_top_mgmt_group_id:
+                organization_subscriptions.append(
                         {
                             'name': group.display_name,
                             'id': group.name,
                         }
                     )
-                vprint(f"Adding Subscription: {group.display_name}", VERBOSE_MEDIUM)
-                break
+                vprint(f"Adding Subscription '{group.display_name}' to the list of organization subscriptions.", VERBOSE_MEDIUM)
+
+            # 2nd: Does this sub belong to the tenant
+            if parent == target_tenant_id:
+                tenant_subscriptions.append(
+                        {
+                            'name': group.display_name,
+                            'id': group.name,
+                        }
+                    )
+                vprint(f"Adding Subscription '{group.display_name}' to the list of tenant subscriptions.", VERBOSE_MEDIUM)
+                # break
 
 ############################################################################
 #                       Phase 1: Delete Resource Groups
@@ -219,13 +228,13 @@ if run_phase['Phase 1']:
     subscriptions_to_wipe = []
     rg_delete_count = 0
 
-    for sub in all_subscriptions: 
-        # We need to loop on all_subscriptions because the subscriptions might have been moved manually out of the organization mgmt group. 
-        vprint(f"Subscription: {sub.display_name}:")
+    for sub in tenant_subscriptions: 
+        # We need to loop on all tenant_subscriptions because the subscriptions might have been moved manually out of the organization mgmt group. 
+        vprint(f"Subscription: {sub['name']}:")
         vprint(sub, VERBOSE_HIGH)
         
         # Retrieve the list of resource groups of this subscription
-        resource_client = ResourceManagementClient(credential, sub.subscription_id)
+        resource_client = ResourceManagementClient(credential, sub['id'])
 
         # Filter resource groups that have the right suffix. If one found, this makes 
         # the current subscription a target subscription
@@ -277,7 +286,7 @@ if run_phase['Phase 1']:
                 network_watcher_rg_candidate = group
             
         if not target_groups:
-            vprint(f"... No target resource groups in Subscription {sub.display_name}. Skipping ...")
+            vprint(f"... No target resource groups in Subscription {sub['name']}. Skipping ...")
             continue
         
         # Else, (if there are target resource groups in this subscription) then this is a subscription to wipe
@@ -290,8 +299,8 @@ if run_phase['Phase 1']:
         # Build the list of target subscriptions and their target groups
         subscriptions_to_wipe.append(
                 {
-                    'name': sub.display_name,
-                    'id': sub.subscription_id,
+                    'name': sub['name'],
+                    'id': sub['id'],
                     'resource_groups': target_groups,
                     'resource_client': resource_client
                 }
@@ -314,8 +323,18 @@ if run_phase['Phase 1']:
                     vprint("Subscription: " + sub['name'], VERBOSE_LOW)
                     vprint(sub, VERBOSE_HIGH)
                     
+                    lock_client = ManagementLockClient(credential, sub['id'])
+
                     # Delete resource groups
                     for group in sub['resource_groups']:
+
+                        # First get the list of resource locks and delete them:
+                        locks = lock_client.management_locks.list_at_resource_group_level(group.name, None)
+                        for lock in locks:
+                            vprint(f"\tDeleting lock {lock.name} on resource group {group.name}")
+                            vprint(lock, VERBOSE_HIGH)
+                            lock_client.management_locks.delete_at_resource_group_level(group.name, lock.name)
+                        
                         vprint(f"\tStarting Deletion of resource group {group.name}")
                         vprint(group, VERBOSE_HIGH)
                         sub['resource_client'].resource_groups.begin_delete(group.name)
@@ -334,14 +353,14 @@ vprint(f"\n============ Phase 2: {PHASE2_DESCRIPTION}\n")
 
 if run_phase['Phase 2']:
     # Move the target subscriptions under the root management group:
-    if subscriptions_in_scope:
-        for sub in subscriptions_in_scope:
+    if organization_subscriptions:
+        for sub in organization_subscriptions:
             vprint(f"Moving Subscription '{sub['name']}' under root ...", VERBOSE_LOW)
-            mg_client.management_group_subscriptions.create(root_mgmt_group.name, sub['id'])
+            mg_client.management_group_subscriptions.create(target_tenant_id, sub['id'])
 
         WAIT_SECONDS = 5
         # Wait WAIT_SECONDS seconds (for each move operation) until the move operations are completed
-        timer = WAIT_SECONDS * len(subscriptions_in_scope)
+        timer = WAIT_SECONDS * len(organization_subscriptions)
         vprint(f"... Waiting {timer} seconds for the move operations to complete ...")
         sleep(timer)
     else:
