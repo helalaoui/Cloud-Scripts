@@ -15,7 +15,7 @@
 #  The context for execution of this script should already have a valid
 #    AWS authentication context: .aws/credentials and .aws/config
 #
-#  Version 1.6 - 2023-06-12
+#  Version 1.7 - 2023-07-06
 #  Author: Hicham El Alaoui - alaoui@it-pro.com
 #
 ############################################################################
